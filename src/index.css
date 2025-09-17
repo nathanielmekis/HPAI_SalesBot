@@ -1,0 +1,23 @@
+/* Reset defaults */
+html, body, #root {
+  height: 100%;
+  width: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+/* Let your App.jsx control the layout fully */
+body {
+  background: #ffffff;   /* neutral so your gradient shows */
+  color: #0a0a0a;
+  font-family: system-ui, Avenir, Helvetica, Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+}
+
+/* Remove the Vite demo styles */
+#root {
+  max-width: none;
+  display: block;
+}
