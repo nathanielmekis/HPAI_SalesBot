@@ -27,6 +27,8 @@ function pickAudioMime() {
 }
 
 export default function App() {
+  const [mode, setMode] = useState("voice"); // 'voice' or 'type'
+  const [textInput, setTextInput] = useState("");
   const [connected, setConnected] = useState(false);
   const [recording, setRecording] = useState(false);
   const [sessionId, setSessionId] = useState("");
@@ -198,6 +200,85 @@ export default function App() {
     }
   };
 
+  // ----- Send typed message -----
+  const sendTextMessage = async () => {
+    if (!textInput?.trim()) return;
+    // Optimistically append user message
+    setMessages(m => {
+      // Append user message, then a provisional assistant 'thinking' bubble
+      return [...m, { role: "user", text: textInput }, { role: "assistant", text: "Thinking…", provisional: true }];
+    });
+    setStatus("Thinking…");
+
+    // Always call the workflow when Send is clicked in Type mode
+    await runWorkflow(textInput);
+
+    setTextInput("");
+  };
+
+  // ----- Call Dify workflow via server proxy -----
+  const runWorkflow = async (query) => {
+    setStatus("Running workflow…");
+    try {
+      const body = {
+        inputs: {
+          query: query || "Hello",
+          qa_dataset_id: "a034b9b4-9b64-40d2-b3c1-951281f84dc6",
+        },
+        response_mode: "blocking",
+        user: "Enoch@HELPORT.AI",
+      };
+
+      const resp = await fetch("/api/workflow", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body)
+      });
+      const json = await resp.json();
+      // Prefer extracting the workflow's 'answer' text (common Dify output shape)
+      let answer = null;
+      try {
+        if (json?.data?.outputs?.segments2 && Array.isArray(json.data.outputs.segments2) && json.data.outputs.segments2.length) {
+          answer = json.data.outputs.segments2[0].answer ?? json.data.outputs.segments2[0].content ?? null;
+        } else if (json?.outputs?.segments2 && Array.isArray(json.outputs.segments2) && json.outputs.segments2.length) {
+          answer = json.outputs.segments2[0].answer ?? json.outputs.segments2[0].content ?? null;
+        } else if (json?.answer) {
+          answer = json.answer;
+        }
+      } catch (e) {
+        answer = null;
+      }
+
+      // Replace the provisional loading message with the final answer
+      setMessages((m) => {
+        const copy = m.slice();
+        // find the last provisional assistant message (we add it in sendTextMessage)
+        for (let i = copy.length - 1; i >= 0; i--) {
+          if (copy[i].role === 'assistant' && copy[i].provisional) {
+            copy[i] = { role: 'assistant', text: answer ? String(answer) : JSON.stringify(json, null, 2) };
+            return copy;
+          }
+        }
+        // If not found, append normally
+        return [...m, { role: 'assistant', text: answer ? String(answer) : JSON.stringify(json, null, 2) }];
+      });
+      setStatus("Ready");
+    } catch (err) {
+      // Replace provisional with an error bubble
+      setMessages((m) => {
+        const copy = m.slice();
+        for (let i = copy.length - 1; i >= 0; i--) {
+          if (copy[i].role === 'assistant' && copy[i].provisional) {
+            copy[i] = { role: 'assistant', text: `Workflow error: ${err?.message || err}` };
+            return copy;
+          }
+        }
+        return [...m, { role: 'assistant', text: `Workflow error: ${err?.message || err}` }];
+      });
+      setStatus(`Workflow error: ${err?.message || err}`);
+    }
+  };
+
   // ----- End mic -----
   const endConversation = () => {
     try {
@@ -325,18 +406,39 @@ export default function App() {
 
           {/* Controls */}
           <div style={styles.controls}>
-            <span style={styles.status}>
-              {status.includes("Listening") ? <Mic size={14}/> : status.includes("Thinking") ? <Loader2 size={14} className="animate-spin"/> : <Volume2 size={14}/>}
-              {status}
-            </span>
+            <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+              <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                <button onClick={() => setMode("voice")} style={{ padding: 8, borderRadius: 8, border: mode === "voice" ? `1px solid ${ACCENT}` : "1px solid rgba(0,0,0,0.06)", background: mode === "voice" ? ACCENT : "transparent", color: mode === "voice" ? "#fff" : "#000" }}>Voice</button>
+                <button onClick={() => setMode("type")} style={{ padding: 8, borderRadius: 8, border: mode === "type" ? `1px solid ${ACCENT}` : "1px solid rgba(0,0,0,0.06)", background: mode === "type" ? ACCENT : "transparent", color: mode === "type" ? "#fff" : "#000" }}>Type</button>
+              </div>
 
-            <button
-              onClick={recording ? endConversation : startConversation}
-              style={styles.cta(recording)}
-              aria-label={recording ? "End conversation" : "Start conversation"}
-            >
-              {recording ? <Square size={16}/> : <Mic size={16}/>} {recording ? "End conversation" : "Start conversation"}
-            </button>
+              <span style={styles.status}>
+                {status.includes("Listening") ? <Mic size={14}/> : status.includes("Thinking") ? <Loader2 size={14} className="animate-spin"/> : <Volume2 size={14}/>}
+                {status}
+              </span>
+            </div>
+
+            {/* Controls: either show recording CTA or text input depending on mode */}
+            {mode === "voice" ? (
+              <button
+                onClick={recording ? endConversation : startConversation}
+                style={styles.cta(recording)}
+                aria-label={recording ? "End conversation" : "Start conversation"}
+              >
+                {recording ? <Square size={16}/> : <Mic size={16}/>} {recording ? "End conversation" : "Start conversation"}
+              </button>
+            ) : (
+              <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                <input
+                  value={textInput}
+                  onChange={(e) => setTextInput(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === "Enter") sendTextMessage(); }}
+                  placeholder="Type your question and press Enter"
+                  style={{ padding: "10px 12px", borderRadius: 20, border: "1px solid rgba(0,0,0,0.08)", minWidth: 300 }}
+                />
+                <button onClick={sendTextMessage} style={styles.cta(false)}>Send</button>
+              </div>
+            )}
           </div>
         </div>
       </main>
