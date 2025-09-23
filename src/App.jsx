@@ -10,6 +10,7 @@ const ACCENT = "#00C389";
 const BG_GRADIENT = `radial-gradient(1200px 600px at 50% -200px, rgba(0,195,137,0.14), transparent),
                      radial-gradient(800px 400px at 90% -100px, rgba(99,102,241,0.10), transparent)`;
 
+
 // Pick a supported audio mime type (Safari prefers mp4/mpeg)
 function pickAudioMime() {
   const candidates = [
@@ -33,6 +34,7 @@ export default function App() {
   const [recording, setRecording] = useState(false);
   const [sessionId, setSessionId] = useState("");
   const [messages, setMessages] = useState([]);
+  const [inputFocused, setInputFocused] = useState(false);
   const [conversationId, setConversationId] = useState(() => {
     try { return localStorage.getItem("dify_conversation_id") || ""; } catch { return ""; }
   });
@@ -44,6 +46,8 @@ export default function App() {
   const audioRef = useRef(null);
   const scrollerRef = useRef(null);
   const API_BASE = import.meta.env.VITE_API_BASE
+  const AVATAR_URL = "/toby.png"; // lives in /public
+
 
   useEffect(() => {
     if (scrollerRef.current) {
@@ -390,7 +394,7 @@ export default function App() {
       overflow: "hidden",
     },
     scroll: { height: "56vh", overflowY: "auto", padding: 20 },
-    emptyText: { opacity: 0.6, fontSize: 14 },
+    emptyText: { opacity: 0.6, fontSize: 18 },
     row: (justify) => ({ display: "flex", justifyContent: justify, marginBottom: 10 }),
     bubble: (me, provisional) => ({
       background: me ? ACCENT : "rgba(255,255,255,0.95)",
@@ -427,6 +431,36 @@ export default function App() {
     status: { fontSize: 12, opacity: 0.7, display: "inline-flex", alignItems: "center", gap: 6 },
     footer: { maxWidth: 1100, width: "100%", margin: "0 auto", padding: "32px 20px", textAlign: "center", fontSize: 12, opacity: 0.6 },
 
+    avatar: {
+      width: 50,
+      height: 50,
+      borderRadius: "50%",
+      flex: "0 0 36px",
+      objectFit: "cover",
+      boxShadow: "0 2px 6px rgba(0,0,0,0.12)",
+      marginRight: 10,              // space between avatar and bubble
+    },
+    rowWithAvatar: {
+      display: "flex",
+      alignItems: "flex-start",
+      gap: 0,
+      marginBottom: 10,
+    },
+
+    input: {
+      padding: "14px 16px",
+      borderRadius: 20,
+      border: "1px solid rgba(0,0,0,0.08)",
+      minWidth: 300,
+      outline: "none",                     // remove blue outline
+      transition: "border-color .15s, box-shadow .15s",
+    },
+    inputFocused: {
+      border: `2px solid ${ACCENT}`,       // green border
+      boxShadow: `0 0 0 3px rgba(0,195,137,0.15) inset`, // soft glow
+    },
+
+    // in styles
     toggle: {
       display: "flex",
       alignItems: "center",
@@ -434,12 +468,13 @@ export default function App() {
       borderRadius: 30,
       overflow: "hidden",
       background: "#ffffff",
-      position: "relative",            // <-- for centered divider
+      position: "relative",
+      boxShadow: "0 4px 12px rgba(0,0,0,0.12)",
     },
     toggleBtn: {
-      flex: 1,                         // <-- each side takes 50%
+      flex: 1,
       minWidth: 0,
-      padding: "8px 14px",
+      padding: "12px 18px",      
       fontSize: 14,
       fontWeight: 600,
       border: "none",
@@ -448,20 +483,16 @@ export default function App() {
       cursor: "pointer",
       lineHeight: 1,
       textAlign: "center",
+      outline: "none",
+      boxShadow: "none",
     },
     toggleBtnActive: {
       background: ACCENT,
       color: "#ffffff",
     },
-    toggleDivider: {
-      position: "absolute",            // <-- overlay, doesn't consume width
-      left: "50%",
-      top: 6,
-      bottom: 6,
-      width: 1,
-      background: "rgba(0,0,0,0.08)",
-      pointerEvents: "none",
-    },
+
+    toggleBtnLeftPad:  { padding: "12px 22px 12px 18px" },  // a touch more right pad
+    toggleBtnRightPad: { padding: "12px 18px 12px 22px" },  // a touch more left pad
 
   };
 
@@ -494,8 +525,17 @@ export default function App() {
             ) : (
               <div>
                 {messages.map((m, i) => (
-                  <motion.div key={i} initial={{opacity:0,y:4}} animate={{opacity:1,y:0}} style={styles.row(m.role === "user" ? "flex-end" : "flex-start")}>
-                    <div style={styles.bubble(m.role === "user", m.provisional)}>{m.text}</div>
+                  <motion.div
+                    key={i}
+                    initial={{ opacity: 0, y: 4 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    style={m.role === "assistant" ? styles.rowWithAvatar : styles.row("flex-end")}
+                  >
+                    {m.role === "assistant" && <img src={AVATAR_URL} alt="Agent" style={styles.avatar} />}
+
+                    <div style={styles.bubble(m.role === "user", m.provisional)}>
+                      {m.text}
+                    </div>
                   </motion.div>
                 ))}
               </div>
@@ -519,7 +559,7 @@ export default function App() {
                   role="tab"
                   aria-selected={mode === "type"}
                   onClick={switchToType}
-                  style={{ ...styles.toggleBtn, ...(mode === "type" ? styles.toggleBtnActive : null) }}
+                  style={{ ...styles.toggleBtn, ...(mode === "type" ? styles.toggleBtnActive : null), ...styles.toggleBtnRightPad, ...styles.toggleBtnLeftPad }}
                 >
                   Text
                 </button>
@@ -547,9 +587,12 @@ export default function App() {
                   value={textInput}
                   onChange={(e) => setTextInput(e.target.value)}
                   onKeyDown={(e) => { if (e.key === "Enter") sendTextMessage(); }}
+                  onFocus={() => setInputFocused(true)}
+                  onBlur={() => setInputFocused(false)}
                   placeholder="Type your question and press Enter"
-                  style={{ padding: "10px 12px", borderRadius: 20, border: "1px solid rgba(0,0,0,0.08)", minWidth: 300 }}
+                  style={{ ...styles.input, ...(inputFocused ? styles.inputFocused : null) }}
                 />
+
                 <button onClick={sendTextMessage} style={styles.cta(false)} aria-label="Send message">
                   <ArrowUp size={16} />
                 </button>
