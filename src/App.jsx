@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from "react";
 import { motion } from "framer-motion";
-import { Mic, Square, Volume2, Loader2 } from "lucide-react";
+import { Mic, Square, Volume2, Loader2, ArrowUp } from "lucide-react";
 
 // Toby Clone Bot – Helport AI
 // Apple-inspired voice chat UI with proper logo reference
@@ -33,6 +33,9 @@ export default function App() {
   const [recording, setRecording] = useState(false);
   const [sessionId, setSessionId] = useState("");
   const [messages, setMessages] = useState([]);
+  const [conversationId, setConversationId] = useState(() => {
+    try { return localStorage.getItem("dify_conversation_id") || ""; } catch { return ""; }
+  });
   const [status, setStatus] = useState("Ready");
 
   const wsRef = useRef(null);
@@ -40,6 +43,7 @@ export default function App() {
   const streamRef = useRef(/** @type {MediaStream|null} */(null));
   const audioRef = useRef(null);
   const scrollerRef = useRef(null);
+  const API_BASE = import.meta.env.VITE_API_BASE
 
   useEffect(() => {
     if (scrollerRef.current) {
@@ -210,74 +214,71 @@ export default function App() {
     });
     setStatus("Thinking…");
 
-    // Always call the workflow when Send is clicked in Type mode
-    await runWorkflow(textInput);
+    await runChat(textInput);
 
     setTextInput("");
   };
 
-  // ----- Call Dify workflow via server proxy -----
-  const runWorkflow = async (query) => {
-    setStatus("Running workflow…");
+  // ----- Call Dify Chatflow via server proxy (blocking) -----
+  const runChat = async (query) => {
+    setStatus("Chatflow…");
     try {
       const body = {
+        query: query,
         inputs: {
-          query: query || "Hello",
+          // carry forward any app vars you used in workflow, e.g. datasets, toggles, etc.
           qa_dataset_id: "a034b9b4-9b64-40d2-b3c1-951281f84dc6",
         },
-        response_mode: "blocking",
+        conversation_id: conversationId || undefined,
         user: "Enoch@HELPORT.AI",
+        response_mode: "blocking",
       };
 
-      const resp = await fetch("/api/workflow", {
+      const resp = await fetch(`${API_BASE}/api/chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body)
+        body: JSON.stringify(body),
       });
       const json = await resp.json();
-      // Prefer extracting the workflow's 'answer' text (common Dify output shape)
-      let answer = null;
-      try {
-        if (json?.data?.outputs?.segments2 && Array.isArray(json.data.outputs.segments2) && json.data.outputs.segments2.length) {
-          answer = json.data.outputs.segments2[0].answer ?? json.data.outputs.segments2[0].content ?? null;
-        } else if (json?.outputs?.segments2 && Array.isArray(json.outputs.segments2) && json.outputs.segments2.length) {
-          answer = json.outputs.segments2[0].answer ?? json.outputs.segments2[0].content ?? null;
-        } else if (json?.answer) {
-          answer = json.answer;
-        }
-      } catch (e) {
-        answer = null;
+
+      // Dify Chatflow commonly returns: { answer, conversation_id, ... }
+      const answer =
+        (typeof json?.answer === "string" && json.answer) ||
+        (typeof json?.data?.answer === "string" && json.data.answer) ||
+        // fallback if a tool returns a structured output
+        JSON.stringify(json, null, 2);
+
+      if (json?.conversation_id && json.conversation_id !== conversationId) {
+        setConversationId(json.conversation_id);
+        try { localStorage.setItem("dify_conversation_id", json.conversation_id); } catch {}
       }
 
-      // Replace the provisional loading message with the final answer
       setMessages((m) => {
         const copy = m.slice();
-        // find the last provisional assistant message (we add it in sendTextMessage)
         for (let i = copy.length - 1; i >= 0; i--) {
-          if (copy[i].role === 'assistant' && copy[i].provisional) {
-            copy[i] = { role: 'assistant', text: answer ? String(answer) : JSON.stringify(json, null, 2) };
+          if (copy[i].role === "assistant" && copy[i].provisional) {
+            copy[i] = { role: "assistant", text: String(answer) };
             return copy;
           }
         }
-        // If not found, append normally
-        return [...m, { role: 'assistant', text: answer ? String(answer) : JSON.stringify(json, null, 2) }];
+        return [...m, { role: "assistant", text: String(answer) }];
       });
       setStatus("Ready");
     } catch (err) {
-      // Replace provisional with an error bubble
       setMessages((m) => {
         const copy = m.slice();
         for (let i = copy.length - 1; i >= 0; i--) {
-          if (copy[i].role === 'assistant' && copy[i].provisional) {
-            copy[i] = { role: 'assistant', text: `Workflow error: ${err?.message || err}` };
+          if (copy[i].role === "assistant" && copy[i].provisional) {
+            copy[i] = { role: "assistant", text: `Chatflow error: ${err?.message || err}` };
             return copy;
           }
         }
-        return [...m, { role: 'assistant', text: `Workflow error: ${err?.message || err}` }];
+        return [...m, { role: "assistant", text: `Chatflow error: ${err?.message || err}` }];
       });
-      setStatus(`Workflow error: ${err?.message || err}`);
+      setStatus(`Chatflow error: ${err?.message || err}`);
     }
   };
+
 
   // ----- End mic -----
   const endConversation = () => {
@@ -292,6 +293,68 @@ export default function App() {
     setRecording(false);
     setStatus("Ready");
   };
+
+  // put inside your App component
+  const newConversation = () => {
+    // Stop mic cleanly if recording
+    try {
+      if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
+        mediaRecorderRef.current.stop();
+      }
+    } catch {}
+    streamRef.current?.getTracks()?.forEach(t => t.stop());
+    streamRef.current = null;
+    setRecording(false);
+
+    // Optionally close the WS session (not required for Dify new chat, but tidy)
+    try { wsRef.current?.close?.(); } catch {}
+
+    // Clear persisted conversation id (and any timestamp you might add later)
+    try {
+      localStorage.removeItem("dify_conversation_id");
+      localStorage.removeItem("dify_conversation_ts"); // if you adopt TTL later
+    } catch {}
+
+    // Reset UI state
+    setConversationId("");
+    setMessages([]);
+    setStatus("Ready");
+  };
+
+  // ====== NEW: minimal helpers to meet your two UI requirements ======
+  // Derived status: hide "Ready/Listening" when in Type mode; only show when thinking
+  const displayStatus =
+    mode === "type" ? (status.includes("Thinking") ? status : "") : status;
+
+  const statusIcon = () => {
+    if (!displayStatus) return null;
+    if (displayStatus.includes("Listening")) return <Mic size={14} />;
+    if (displayStatus.includes("Thinking") || displayStatus.includes("Chatflow"))
+      return <Loader2 size={14} className="animate-spin" />;
+    return <Volume2 size={14} />;
+  };
+
+  // Mode switches: when entering Type, stop mic and clear idle status
+  const switchToVoice = () => setMode("voice");
+  const switchToType = () => {
+    if (recording) endConversation();
+    setMode("type");
+    if (!status.includes("Thinking")) setStatus("");
+  };
+
+  // Mode-aware empty-state copy
+  const EmptyHint = () => (
+    <div style={styles.emptyText}>
+      {mode === "voice" ? (
+        <>
+          Click <span style={{ fontWeight: 600, color: ACCENT }}>Start conversation</span> and speak — we’ll transcribe, retrieve, and reply.
+        </>
+      ) : (
+        <>Type a question below and press <span style={{ fontWeight: 600, color: ACCENT }}>Enter</span> — we’ll retrieve and reply.</>
+      )}
+    </div>
+  );
+  // ================================================================
 
   // ----- Styles -----
   const styles = {
@@ -363,6 +426,43 @@ export default function App() {
     }),
     status: { fontSize: 12, opacity: 0.7, display: "inline-flex", alignItems: "center", gap: 6 },
     footer: { maxWidth: 1100, width: "100%", margin: "0 auto", padding: "32px 20px", textAlign: "center", fontSize: 12, opacity: 0.6 },
+
+    toggle: {
+      display: "flex",
+      alignItems: "center",
+      border: `1px solid ${ACCENT}`,
+      borderRadius: 30,
+      overflow: "hidden",
+      background: "#ffffff",
+      position: "relative",            // <-- for centered divider
+    },
+    toggleBtn: {
+      flex: 1,                         // <-- each side takes 50%
+      minWidth: 0,
+      padding: "8px 14px",
+      fontSize: 14,
+      fontWeight: 600,
+      border: "none",
+      background: "transparent",
+      color: ACCENT,
+      cursor: "pointer",
+      lineHeight: 1,
+      textAlign: "center",
+    },
+    toggleBtnActive: {
+      background: ACCENT,
+      color: "#ffffff",
+    },
+    toggleDivider: {
+      position: "absolute",            // <-- overlay, doesn't consume width
+      left: "50%",
+      top: 6,
+      bottom: 6,
+      width: 1,
+      background: "rgba(0,0,0,0.08)",
+      pointerEvents: "none",
+    },
+
   };
 
   return (
@@ -389,9 +489,7 @@ export default function App() {
           <div ref={scrollerRef} style={styles.scroll}>
             {messages.length === 0 ? (
               <div style={{ height: "100%", display: "grid", placeItems: "center" }}>
-                <div style={styles.emptyText}>
-                  Tap <span style={{fontWeight:600, color: ACCENT}}>Start conversation</span> and speak — we’ll transcribe, retrieve, and reply.
-                </div>
+                <EmptyHint />
               </div>
             ) : (
               <div>
@@ -407,15 +505,31 @@ export default function App() {
           {/* Controls */}
           <div style={styles.controls}>
             <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-              <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-                <button onClick={() => setMode("voice")} style={{ padding: 8, borderRadius: 8, border: mode === "voice" ? `1px solid ${ACCENT}` : "1px solid rgba(0,0,0,0.06)", background: mode === "voice" ? ACCENT : "transparent", color: mode === "voice" ? "#fff" : "#000" }}>Voice</button>
-                <button onClick={() => setMode("type")} style={{ padding: 8, borderRadius: 8, border: mode === "type" ? `1px solid ${ACCENT}` : "1px solid rgba(0,0,0,0.06)", background: mode === "type" ? ACCENT : "transparent", color: mode === "type" ? "#fff" : "#000" }}>Type</button>
+              <div style={styles.toggle} role="tablist" aria-label="Input mode">
+                <button
+                  role="tab"
+                  aria-selected={mode === "voice"}
+                  onClick={switchToVoice}
+                  style={{ ...styles.toggleBtn, ...(mode === "voice" ? styles.toggleBtnActive : null) }}
+                >
+                  Voice
+                </button>
+                <div aria-hidden style={styles.toggleDivider} />
+                <button
+                  role="tab"
+                  aria-selected={mode === "type"}
+                  onClick={switchToType}
+                  style={{ ...styles.toggleBtn, ...(mode === "type" ? styles.toggleBtnActive : null) }}
+                >
+                  Text
+                </button>
               </div>
-
-              <span style={styles.status}>
-                {status.includes("Listening") ? <Mic size={14}/> : status.includes("Thinking") ? <Loader2 size={14} className="animate-spin"/> : <Volume2 size={14}/>}
-                {status}
-              </span>
+              {displayStatus && (
+                <span style={styles.status}>
+                  {statusIcon()}
+                  {displayStatus}
+                </span>
+              )}
             </div>
 
             {/* Controls: either show recording CTA or text input depending on mode */}
@@ -436,9 +550,18 @@ export default function App() {
                   placeholder="Type your question and press Enter"
                   style={{ padding: "10px 12px", borderRadius: 20, border: "1px solid rgba(0,0,0,0.08)", minWidth: 300 }}
                 />
-                <button onClick={sendTextMessage} style={styles.cta(false)}>Send</button>
+                <button onClick={sendTextMessage} style={styles.cta(false)} aria-label="Send message">
+                  <ArrowUp size={16} />
+                </button>
               </div>
             )}
+            <button
+              onClick={newConversation}
+              style={{ ...styles.cta(false), background: '#ffffff', color: ACCENT, border: `1px solid ${ACCENT}` }}
+              aria-label="Start a new conversation"
+            >
+              New conversation
+            </button>
           </div>
         </div>
       </main>
