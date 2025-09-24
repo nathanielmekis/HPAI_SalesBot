@@ -47,7 +47,19 @@ export default function App() {
   const scrollerRef = useRef(null);
   const API_BASE = import.meta.env.VITE_API_BASE || "";
   const AVATAR_URL = "/toby.png"; // lives in /public
+  const START_FRESH_ON_LOAD = true;
 
+
+  useEffect(() => {
+    if (!START_FRESH_ON_LOAD) return;
+    try {
+      localStorage.removeItem("dify_conversation_id");
+      localStorage.removeItem("dify_conversation_ts"); // if you ever added TTL
+    } catch {}
+    setConversationId("");   // force a new thread
+    setMessages([]);         // clear UI
+    setStatus("Ready");
+  }, []); // runs once after first render
 
   useEffect(() => {
     if (scrollerRef.current) {
@@ -354,7 +366,14 @@ export default function App() {
           Click <span style={{ fontWeight: 600, color: ACCENT }}>Start conversation</span> and speak — we’ll transcribe, retrieve, and reply.
         </>
       ) : (
-        <>Type a question below and press <span style={{ fontWeight: 600, color: ACCENT }}>Enter</span> — we’ll retrieve and reply.</>
+        <>
+          <div 
+            style={{ marginBottom: 18 }}>Press <span style={{ fontWeight: 600, color: ACCENT }}>New conversation</span> for a new chat.
+          </div>
+          <div>
+            Type a question below and press <span style={{ fontWeight: 600, color: ACCENT }}>Enter</span> — we’ll retrieve and reply.
+          </div>
+        </>
       )}
     </div>
   );
@@ -394,7 +413,7 @@ export default function App() {
       overflow: "hidden",
     },
     scroll: { height: "56vh", overflowY: "auto", padding: 20 },
-    emptyText: { opacity: 0.6, fontSize: 18 },
+    emptyText: { opacity: 0.6, fontSize: 18, textAlign: 'center' },
     row: (justify) => ({ display: "flex", justifyContent: justify, marginBottom: 10 }),
     bubble: (me, provisional) => ({
       background: me ? ACCENT : "rgba(255,255,255,0.95)",

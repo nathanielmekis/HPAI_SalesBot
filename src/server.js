@@ -82,8 +82,6 @@ app.get(/^\/(?!api).*/, (req, res) => {
   res.sendFile(path.join(distDir, "index.html"));
 });
 
-
-
 server.on("upgrade", (req, socket, head) => {
   if (req.url?.startsWith("/api/voicechat")) {
     wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
