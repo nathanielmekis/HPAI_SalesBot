@@ -67,12 +67,11 @@ app.post("/api/chat", async (req, res) => {
 const distDir = path.join(__dirname, "..", "dist");
 app.use(express.static(distDir));
 
-// SPA fallback: send index.html for any non-API route
-app.get("*", (req, res) => {
-  // don't catch API/WS upgrades
-  if (req.path.startsWith("/api")) return res.status(404).send("Not found");
+// ✅ Express 5–compatible SPA fallback that skips /api
+app.get(/^\/(?!api).*/, (req, res) => {
   res.sendFile(path.join(distDir, "index.html"));
 });
+
 
 
 server.on("upgrade", (req, socket, head) => {
