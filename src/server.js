@@ -13,9 +13,11 @@ const __dirname = path.dirname(__filename);
 const app = express();
 // parse JSON bodies for API routes
 app.use(express.json());
-// Minimal CORS for local development (allow Vite dev server to call this API)
+// Minimal CORS for local development (not needed in prod same-origin)
 app.use((req, res, next) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
+  if (process.env.NODE_ENV !== "production") {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+  }
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
   if (req.method === 'OPTIONS') return res.sendStatus(204);
@@ -65,7 +67,15 @@ app.post("/api/chat", async (req, res) => {
 });
 
 const distDir = path.join(__dirname, "..", "dist");
-app.use(express.static(distDir));
+app.use(express.static(distDir, {
+  setHeaders(res, filePath) {
+    if (/\.(js|css|png|jpg|jpeg|gif|svg|webp|ico)$/.test(filePath)) {
+      res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+    } else {
+      res.setHeader("Cache-Control", "no-cache");
+    }
+  },
+}));
 
 // ✅ Express 5–compatible SPA fallback that skips /api
 app.get(/^\/(?!api).*/, (req, res) => {
@@ -75,7 +85,7 @@ app.get(/^\/(?!api).*/, (req, res) => {
 
 
 server.on("upgrade", (req, socket, head) => {
-  if (req.url === "/api/voicechat") {
+  if (req.url?.startsWith("/api/voicechat")) {
     wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
   } else {
     socket.destroy();
