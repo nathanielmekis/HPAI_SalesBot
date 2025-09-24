@@ -27,50 +27,30 @@ const server = http.createServer(app);
 const wss = new WebSocketServer({ noServer: true });
 
 app.get("/health", (_, res) => res.send("ok"));
-// replace your existing /api/chat handler with this:
-
+// 🔄 Replace your existing /api/chat handler with this one
 function normalizeBase(u) {
   return (u || "https://agent.helport.ai")
-    .replace(/\/+$/,'')
-    .replace(/\/v1$/,'');
+    .replace(/\/+$/,'')   // trim trailing slash
+    .replace(/\/v1$/,''); // remove accidental /v1
 }
 
 app.post("/api/chat", async (req, res) => {
   const apiKey = process.env.DIFY_API_KEY;
   const base   = normalizeBase(process.env.DIFY_BASE_URL);
-  const kind   = (process.env.DIFY_APP_TYPE || "workflow").toLowerCase(); // ← set to "workflow"
-
   if (!apiKey) return res.status(500).json({ error: "DIFY_API_KEY not set" });
 
   try {
-    const { query, inputs = {}, conversation_id, user, response_mode } = req.body || {};
-    const mode = response_mode || "blocking";
-    const theUser = user || process.env.DIFY_DEFAULT_USER || "web";
-
-    let upstreamUrl, upstreamBody;
-
-    if (kind === "chat") {
-      if (!query || typeof query !== "string") {
-        return res.status(400).json({ error: "Missing required 'query' string for chat app" });
-      }
-      upstreamUrl  = `${base}/v1/chat-messages`;
-      upstreamBody = { query, inputs, conversation_id, user: theUser, response_mode: mode };
-    } else if (kind === "completion") {
-      // completion apps don't use 'query'; pass everything via inputs
-      upstreamUrl  = `${base}/v1/completion-messages`;
-      upstreamBody = { inputs, user: theUser, response_mode: mode };
-    } else { // workflow / chatflow
-      // put the user's question inside inputs for the workflow
-      if (!query || typeof query !== "string") {
-        return res.status(400).json({ error: "Missing required 'query' string for workflow run" });
-      }
-      upstreamUrl  = `${base}/v1/workflows/run`;
-      upstreamBody = {
-        inputs: { query, ...inputs },
-        user: theUser,
-        response_mode: mode
-      };
+    const { query, inputs = {}, user, response_mode } = req.body || {};
+    if (!query || typeof query !== "string") {
+      return res.status(400).json({ error: "Missing required 'query' string" });
     }
+
+    const upstreamUrl  = `${base}/v1/workflows/run`;
+    const upstreamBody = {
+      inputs: { query, ...inputs },                // ⬅️ Chatflow expects the prompt inside inputs
+      user:   user || process.env.DIFY_DEFAULT_USER || "web",
+      response_mode: response_mode || "blocking",
+    };
 
     const r = await fetch(upstreamUrl, {
       method: "POST",
@@ -79,8 +59,7 @@ app.post("/api/chat", async (req, res) => {
     });
 
     const raw = await r.text();
-    console.log(`[Dify ${r.status}] ${upstreamUrl}`);
-
+    // Return JSON if possible; otherwise forward plain text (prevents “Unexpected token '<'”)
     try {
       const json = JSON.parse(raw);
       return res.status(r.status).json(json);
