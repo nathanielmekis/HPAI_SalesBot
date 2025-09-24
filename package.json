@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite",
     "server": "node src/server.js",
-    "dev:all": "concurrently -k -n VITE,WS -c cyan,magenta \"npm run dev\" \"npm run server\""
+    "dev:all": "concurrently -k -n VITE,WS -c cyan,magenta \"npm run dev\" \"npm run server\"",
+    "build": "vite build"
   },
   "dependencies": {
     "express": "^5.1.0",

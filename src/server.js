@@ -3,6 +3,12 @@ import http from "http";
 import express from "express";
 import { WebSocketServer } from "ws";
 import 'dotenv/config';
+import path from "path";
+import { fileURLToPath } from "url";
+
+// __dirname in ESM
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const app = express();
 // parse JSON bodies for API routes
@@ -56,6 +62,16 @@ app.post("/api/chat", async (req, res) => {
   } catch (err) {
     return res.status(500).json({ error: String(err) });
   }
+});
+
+const distDir = path.join(__dirname, "..", "dist");
+app.use(express.static(distDir));
+
+// SPA fallback: send index.html for any non-API route
+app.get("*", (req, res) => {
+  // don't catch API/WS upgrades
+  if (req.path.startsWith("/api")) return res.status(404).send("Not found");
+  res.sendFile(path.join(distDir, "index.html"));
 });
 
 

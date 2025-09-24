@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from "react";
-import { motion } from "framer-motion";
+import { color, motion } from "framer-motion";
 import { Mic, Square, Volume2, Loader2, ArrowUp } from "lucide-react";
 
 // Toby Clone Bot – Helport AI
@@ -45,7 +45,7 @@ export default function App() {
   const streamRef = useRef(/** @type {MediaStream|null} */(null));
   const audioRef = useRef(null);
   const scrollerRef = useRef(null);
-  const API_BASE = import.meta.env.VITE_API_BASE
+  const API_BASE = import.meta.env.VITE_API_BASE || "";
   const AVATAR_URL = "/toby.png"; // lives in /public
 
 
@@ -387,7 +387,7 @@ export default function App() {
     cardWrap: { maxWidth: 820, width: "100%", margin: "0 auto", padding: "0 20px" },
     card: {
       borderRadius: 24,
-      border: "1px solid rgba(0,0,0,0.08)",
+      border: "2px solid rgba(0,0,0,0.08)",
       background: "rgba(255,255,255,0.85)",
       backdropFilter: "blur(8px)",
       boxShadow: "0 6px 24px rgba(0,0,0,0.06)",
@@ -450,14 +450,17 @@ export default function App() {
     input: {
       padding: "14px 16px",
       borderRadius: 20,
-      border: "1px solid rgba(0,0,0,0.08)",
       minWidth: 300,
-      outline: "none",                     // remove blue outline
+      outline: "none",                     
       transition: "border-color .15s, box-shadow .15s",
+      fontWeight: 400,
+      color: "#0a0a0a",
+      boxShadow: "0 4px 12px rgba(0,0,0,0.12)",
+      border: `1px solid ${ACCENT}`
     },
     inputFocused: {
-      border: `2px solid ${ACCENT}`,       // green border
-      boxShadow: `0 0 0 3px rgba(0,195,137,0.15) inset`, // soft glow
+      border: `1px solid ${ACCENT}`,       // green border
+      boxShadow: `0 0 0 4px rgba(0,195,137,0.15) inset`, // soft glow
     },
 
     // in styles
