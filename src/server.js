@@ -34,43 +34,74 @@ function normalizeBase(u) {
     .replace(/\/v1$/,''); // remove accidental /v1
 }
 
+
+// NEW /api/chat with smart fallback: chat-messages -> workflows/run
 app.post("/api/chat", async (req, res) => {
   const apiKey = process.env.DIFY_API_KEY;
-  const base   = normalizeBase(process.env.DIFY_BASE_URL);
   if (!apiKey) return res.status(500).json({ error: "DIFY_API_KEY not set" });
 
+  const baseUrl = (process.env.DIFY_BASE_URL || "https://agent.helport.ai").replace(/\/+$/,''); // no trailing slash
+
+  // body from client
+  const { query, inputs = {}, conversation_id, user, response_mode } = req.body || {};
+  if (!query || typeof query !== "string") {
+    return res.status(400).json({ error: "Missing required 'query' string" });
+  }
+
+  // common settings
+  const headers = {
+    "Content-Type": "application/json",
+    "Authorization": `Bearer ${apiKey}`,
+  };
+  const userId = user || process.env.DIFY_DEFAULT_USER || "web";
+  const respMode = response_mode || "blocking";
+
+  // Attempt 1: chat-messages (for “App / Chat”)
+  const bodyChat = {
+    query,
+    inputs,
+    conversation_id,
+    user: userId,
+    response_mode: respMode,
+  };
+
   try {
-    const { query, inputs = {}, user, response_mode } = req.body || {};
-    if (!query || typeof query !== "string") {
-      return res.status(400).json({ error: "Missing required 'query' string" });
-    }
-
-    const upstreamUrl  = `${base}/v1/workflows/run`;
-    const upstreamBody = {
-      inputs: { query, ...inputs },                // ⬅️ Chatflow expects the prompt inside inputs
-      user:   user || process.env.DIFY_DEFAULT_USER || "web",
-      response_mode: response_mode || "blocking",
-    };
-
-    const r = await fetch(upstreamUrl, {
+    let upstream = await fetch(`${baseUrl}/v1/chat-messages`, {
       method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-      body: JSON.stringify(upstreamBody),
+      headers,
+      body: JSON.stringify(bodyChat),
     });
 
-    const raw = await r.text();
-    // Return JSON if possible; otherwise forward plain text (prevents “Unexpected token '<'”)
-    try {
-      const json = JSON.parse(raw);
-      return res.status(r.status).json(json);
-    } catch {
-      return res.status(r.status).type("text/plain").send(raw);
+    // If upstream doesn’t support this route, fall back to workflows/run
+    if (upstream.status === 404 || upstream.status === 405) {
+      // Attempt 2: workflows/run (for “Workflow / Chatflow”)
+      // Many Dify setups expect the user prompt in inputs under a reserved key.
+      // We'll send it as `query`, *and* also mirror as `input` to be safe.
+      const bodyFlow = {
+        inputs: { query, input: query, ...inputs },
+        user: userId,
+        response_mode: respMode,
+        // some installs accept conversation_id for memory-enabled workflows
+        conversation_id,
+      };
+
+      upstream = await fetch(`${baseUrl}/v1/workflows/run`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(bodyFlow),
+      });
     }
+
+    const text = await upstream.text();
+    let json;
+    try { json = JSON.parse(text); } catch { json = { error: "Upstream returned non-JSON", status: upstream.status, body: text }; }
+    return res.status(upstream.status).json(json);
+
   } catch (err) {
-    console.error("Proxy /api/chat error:", err);
-    return res.status(500).json({ error: String(err) });
+    return res.status(500).json({ error: `Proxy error: ${String(err)}` });
   }
 });
+
 
 
 
