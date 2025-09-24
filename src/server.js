@@ -34,7 +34,6 @@ app.post("/api/chat", async (req, res) => {
   if (!apiKey) return res.status(500).json({ error: "DIFY_API_KEY not set" });
 
   try {
-    // expected body: { query, inputs?, conversation_id?, user?, response_mode? }
     const { query, inputs = {}, conversation_id, user, response_mode } = req.body || {};
     if (!query || typeof query !== "string") {
       return res.status(400).json({ error: "Missing required 'query' string" });
@@ -45,13 +44,19 @@ app.post("/api/chat", async (req, res) => {
       inputs,
       conversation_id,
       user: user || process.env.DIFY_DEFAULT_USER || "web",
-      // you can pass 'streaming' from client later; for now keep it simple:
       response_mode: response_mode || "blocking",
     };
-    console.log("Proxying chat payload:", JSON.stringify(body));
 
-    const baseUrl = process.env.DIFY_BASE_URL || "https://agent.helport.ai";
-    const resp = await fetch(`${baseUrl}/v1/chat-messages`, {
+    // Normalize base URL: ensure NO trailing /v1 (we add it)
+    const rawBase = process.env.DIFY_BASE_URL || "https://agent.helport.ai";
+    const base = rawBase.replace(/\/v1\/?$/, "");
+    const url = `${base}/v1/chat-messages`; // Chatflow endpoint
+
+    // Log what we’re about to call
+    console.log("Proxying ->", url, "status: pending");
+    console.log("Payload:", JSON.stringify(body));
+
+    const upstream = await fetch(url, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -59,12 +64,28 @@ app.post("/api/chat", async (req, res) => {
       },
       body: JSON.stringify(body),
     });
-    const json = await resp.json();
-    return res.status(resp.status).json(json);
+
+    // Read as text first so we can handle HTML/JSON safely
+    const text = await upstream.text();
+    const type = upstream.headers.get("content-type") || "";
+
+    // If JSON, relay JSON. If not, wrap the text so the client never explodes.
+    if (type.includes("application/json")) {
+      return res.status(upstream.status).type("application/json").send(text);
+    } else {
+      console.error("Upstream non-JSON:", upstream.status, type, text.slice(0, 300));
+      return res.status(500).json({
+        error: "Upstream returned non-JSON",
+        status: upstream.status,
+        body: text,
+      });
+    }
   } catch (err) {
+    console.error("Proxy /api/chat error:", err);
     return res.status(500).json({ error: String(err) });
   }
 });
+
 
 const distDir = path.join(__dirname, "..", "dist");
 app.use(express.static(distDir, {
