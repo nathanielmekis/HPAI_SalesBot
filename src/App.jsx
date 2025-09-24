@@ -367,9 +367,6 @@ export default function App() {
         </>
       ) : (
         <>
-          <div 
-            style={{ marginBottom: 18 }}>Press <span style={{ fontWeight: 600, color: ACCENT }}>New conversation</span> for a new chat.
-          </div>
           <div>
             Type a question below and press <span style={{ fontWeight: 600, color: ACCENT }}>Enter</span> — we’ll retrieve and reply.
           </div>
