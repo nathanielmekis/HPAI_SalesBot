@@ -3,21 +3,13 @@ import http from "http";
 import express from "express";
 import { WebSocketServer } from "ws";
 import 'dotenv/config';
-import path from "path";
-import { fileURLToPath } from "url";
-
-// __dirname in ESM
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
 
 const app = express();
 // parse JSON bodies for API routes
 app.use(express.json());
-// Minimal CORS for local development (not needed in prod same-origin)
+// Minimal CORS for local development (allow Vite dev server to call this API)
 app.use((req, res, next) => {
-  if (process.env.NODE_ENV !== "production") {
-    res.setHeader('Access-Control-Allow-Origin', '*');
-  }
+  res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
   if (req.method === 'OPTIONS') return res.sendStatus(204);
@@ -28,36 +20,26 @@ const wss = new WebSocketServer({ noServer: true });
 
 app.get("/health", (_, res) => res.send("ok"));
 
-// NEW: Proxy endpoint for Dify Chatflow (Advanced Chat)
-app.post("/api/chat", async (req, res) => {
+// Proxy endpoint to call a Dify workflow. Expects JSON body forwarded to workflow input.
+app.post("/api/workflow", async (req, res) => {
   const apiKey = process.env.DIFY_API_KEY;
   if (!apiKey) return res.status(500).json({ error: "DIFY_API_KEY not set" });
 
   try {
-    // expected body: { query, inputs?, conversation_id?, user?, response_mode? }
-    const { query, inputs = {}, conversation_id, user, response_mode } = req.body || {};
-    if (!query || typeof query !== "string") {
-      return res.status(400).json({ error: "Missing required 'query' string" });
-    }
+    // Ensure the payload matches the shape the Dify API expects.
+    // The client already sends the top-level { inputs: {...}, response_mode, user }
+    const payload = { ...req.body };
+    // If user is missing, allow a default via DIFY_DEFAULT_USER for dev convenience
+    if (!payload.user && process.env.DIFY_DEFAULT_USER) payload.user = process.env.DIFY_DEFAULT_USER;
+    console.log("Proxying workflow payload:", JSON.stringify(payload));
 
-    const body = {
-      query,
-      inputs,
-      conversation_id,
-      user: user || process.env.DIFY_DEFAULT_USER || "web",
-      // you can pass 'streaming' from client later; for now keep it simple:
-      response_mode: response_mode || "blocking",
-    };
-    console.log("Proxying chat payload:", JSON.stringify(body));
-
-    const baseUrl = process.env.DIFY_BASE_URL || "https://agent.helport.ai";
-    const resp = await fetch(`${baseUrl}/v1/chat-messages`, {
+    const resp = await fetch(`https://agent.helport.ai/v1/workflows/run`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "Authorization": `Bearer ${apiKey}`,
+        "Authorization": `Bearer ${apiKey}`
       },
-      body: JSON.stringify(body),
+      body: JSON.stringify(payload)
     });
     const json = await resp.json();
     return res.status(resp.status).json(json);
@@ -66,24 +48,8 @@ app.post("/api/chat", async (req, res) => {
   }
 });
 
-const distDir = path.join(__dirname, "..", "dist");
-app.use(express.static(distDir, {
-  setHeaders(res, filePath) {
-    if (/\.(js|css|png|jpg|jpeg|gif|svg|webp|ico)$/.test(filePath)) {
-      res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
-    } else {
-      res.setHeader("Cache-Control", "no-cache");
-    }
-  },
-}));
-
-// ✅ Express 5–compatible SPA fallback that skips /api
-app.get(/^\/(?!api).*/, (req, res) => {
-  res.sendFile(path.join(distDir, "index.html"));
-});
-
 server.on("upgrade", (req, socket, head) => {
-  if (req.url?.startsWith("/api/voicechat")) {
+  if (req.url === "/api/voicechat") {
     wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
   } else {
     socket.destroy();

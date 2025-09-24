@@ -49,6 +49,38 @@ export default function App() {
   const AVATAR_URL = "/toby.png"; // lives in /public
   const START_FRESH_ON_LOAD = true;
 
+  
+  // ---- Local history cache (per browser) ----
+  const LS_INDEX = "dify_convo_index_v1"; // [{id,title,updated}] newest first
+  const convoKey = (id) => `dify_conversation_cache::${id}`;
+
+  function loadIndex() {
+    try { return JSON.parse(localStorage.getItem(LS_INDEX) || "[]"); } catch { return []; }
+  }
+  function saveIndex(list) {
+    try { localStorage.setItem(LS_INDEX, JSON.stringify(list)); } catch {}
+  }
+  function loadConversationMessages(id) {
+    try { return JSON.parse(localStorage.getItem(convoKey(id)) || "[]"); } catch { return []; }
+  }
+  function saveConversationSnapshot(id, title, messages) {
+    if (!id) return; // only after Dify returns an id
+    try { localStorage.setItem(convoKey(id), JSON.stringify(messages)); } catch {}
+    const now = Date.now();
+    const idx = loadIndex();
+    const firstUser = messages.find(m => m.role === "user")?.text;
+    const name = title || (firstUser ? firstUser.slice(0, 60) : "Untitled conversation");
+    const existing = idx.find(x => x.id === id);
+    if (existing) {
+      existing.title = name;
+      existing.updated = now;
+    } else {
+      idx.push({ id, title: name, updated: now });
+    }
+    idx.sort((a,b)=> (b.updated||0)-(a.updated||0));
+    saveIndex(idx);
+  }
+
 
   useEffect(() => {
     if (!START_FRESH_ON_LOAD) return;
@@ -274,11 +306,22 @@ export default function App() {
         for (let i = copy.length - 1; i >= 0; i--) {
           if (copy[i].role === "assistant" && copy[i].provisional) {
             copy[i] = { role: "assistant", text: String(answer) };
+            // SAVE snapshot with latest messages
+            try {
+              const idToUse = json?.conversation_id || conversationId;
+              if (idToUse) saveConversationSnapshot(idToUse, json?.conversation_name, copy);
+            } catch {}
             return copy;
           }
         }
-        return [...m, { role: "assistant", text: String(answer) }];
+        const next = [...m, { role: "assistant", text: String(answer) }];
+        try {
+          const idToUse = json?.conversation_id || conversationId;
+          if (idToUse) saveConversationSnapshot(idToUse, json?.conversation_name, next);
+        } catch {}
+        return next;
       });
+
       setStatus("Ready");
     } catch (err) {
       setMessages((m) => {
@@ -367,14 +410,11 @@ export default function App() {
         </>
       ) : (
         <>
-          <div>
             Type a question below and press <span style={{ fontWeight: 600, color: ACCENT }}>Enter</span> — we’ll retrieve and reply.
-          </div>
         </>
       )}
     </div>
   );
-  // ================================================================
 
   // ----- Styles -----
   const styles = {
