@@ -240,8 +240,11 @@ export default function App() {
     setStatus("Chatflow…");
     try {
       const body = {
-        query,
-        inputs: { qa_dataset_id: "a034b9b4-9b64-40d2-b3c1-951281f84dc6" },
+        query: query,
+        inputs: {
+          // carry forward any app vars you used in workflow, e.g. datasets, toggles, etc.
+          qa_dataset_id: "a034b9b4-9b64-40d2-b3c1-951281f84dc6",
+        },
         conversation_id: conversationId || undefined,
         user: "Enoch@HELPORT.AI",
         response_mode: "blocking",
@@ -252,19 +255,13 @@ export default function App() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
       });
+      const json = await resp.json();
 
-      const raw = await resp.text();
-      let json;
-      try { json = JSON.parse(raw); } catch { json = null; }
-
-      if (!resp.ok) {
-        const msg = json?.error || raw?.slice(0, 300) || `HTTP ${resp.status}`;
-        throw new Error(`Upstream error: ${msg}`);
-      }
-
+      // Dify Chatflow commonly returns: { answer, conversation_id, ... }
       const answer =
         (typeof json?.answer === "string" && json.answer) ||
         (typeof json?.data?.answer === "string" && json.data.answer) ||
+        // fallback if a tool returns a structured output
         JSON.stringify(json, null, 2);
 
       if (json?.conversation_id && json.conversation_id !== conversationId) {
@@ -282,23 +279,21 @@ export default function App() {
         }
         return [...m, { role: "assistant", text: String(answer) }];
       });
-
       setStatus("Ready");
     } catch (err) {
       setMessages((m) => {
         const copy = m.slice();
         for (let i = copy.length - 1; i >= 0; i--) {
           if (copy[i].role === "assistant" && copy[i].provisional) {
-            copy[i] = { role: "assistant", text: String(err?.message || err) };
+            copy[i] = { role: "assistant", text: `Chatflow error: ${err?.message || err}` };
             return copy;
           }
         }
-        return [...m, { role: "assistant", text: String(err?.message || err) }];
+        return [...m, { role: "assistant", text: `Chatflow error: ${err?.message || err}` }];
       });
       setStatus(`Chatflow error: ${err?.message || err}`);
     }
   };
-
 
 
   // ----- End mic -----

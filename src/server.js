@@ -27,83 +27,44 @@ const server = http.createServer(app);
 const wss = new WebSocketServer({ noServer: true });
 
 app.get("/health", (_, res) => res.send("ok"));
-// 🔄 Replace your existing /api/chat handler with this one
-function normalizeBase(u) {
-  return (u || "https://agent.helport.ai")
-    .replace(/\/+$/,'')   // trim trailing slash
-    .replace(/\/v1$/,''); // remove accidental /v1
-}
 
-
-// NEW /api/chat with smart fallback: chat-messages -> workflows/run
+// NEW: Proxy endpoint for Dify Chatflow (Advanced Chat)
 app.post("/api/chat", async (req, res) => {
   const apiKey = process.env.DIFY_API_KEY;
   if (!apiKey) return res.status(500).json({ error: "DIFY_API_KEY not set" });
 
-  const baseUrl = (process.env.DIFY_BASE_URL || "https://agent.helport.ai").replace(/\/+$/,''); // no trailing slash
-
-  // body from client
-  const { query, inputs = {}, conversation_id, user, response_mode } = req.body || {};
-  if (!query || typeof query !== "string") {
-    return res.status(400).json({ error: "Missing required 'query' string" });
-  }
-
-  // common settings
-  const headers = {
-    "Content-Type": "application/json",
-    "Authorization": `Bearer ${apiKey}`,
-  };
-  const userId = user || process.env.DIFY_DEFAULT_USER || "web";
-  const respMode = response_mode || "blocking";
-
-  // Attempt 1: chat-messages (for “App / Chat”)
-  const bodyChat = {
-    query,
-    inputs,
-    conversation_id,
-    user: userId,
-    response_mode: respMode,
-  };
-
   try {
-    let upstream = await fetch(`${baseUrl}/v1/chat-messages`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify(bodyChat),
-    });
-
-    // If upstream doesn’t support this route, fall back to workflows/run
-    if (upstream.status === 404 || upstream.status === 405) {
-      // Attempt 2: workflows/run (for “Workflow / Chatflow”)
-      // Many Dify setups expect the user prompt in inputs under a reserved key.
-      // We'll send it as `query`, *and* also mirror as `input` to be safe.
-      const bodyFlow = {
-        inputs: { query, input: query, ...inputs },
-        user: userId,
-        response_mode: respMode,
-        // some installs accept conversation_id for memory-enabled workflows
-        conversation_id,
-      };
-
-      upstream = await fetch(`${baseUrl}/v1/workflows/run`, {
-        method: "POST",
-        headers,
-        body: JSON.stringify(bodyFlow),
-      });
+    // expected body: { query, inputs?, conversation_id?, user?, response_mode? }
+    const { query, inputs = {}, conversation_id, user, response_mode } = req.body || {};
+    if (!query || typeof query !== "string") {
+      return res.status(400).json({ error: "Missing required 'query' string" });
     }
 
-    const text = await upstream.text();
-    let json;
-    try { json = JSON.parse(text); } catch { json = { error: "Upstream returned non-JSON", status: upstream.status, body: text }; }
-    return res.status(upstream.status).json(json);
+    const body = {
+      query,
+      inputs,
+      conversation_id,
+      user: user || process.env.DIFY_DEFAULT_USER || "web",
+      // you can pass 'streaming' from client later; for now keep it simple:
+      response_mode: response_mode || "blocking",
+    };
+    console.log("Proxying chat payload:", JSON.stringify(body));
 
+    const baseUrl = process.env.DIFY_BASE_URL || "https://agent.helport.ai";
+    const resp = await fetch(`${baseUrl}/v1/chat-messages`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify(body),
+    });
+    const json = await resp.json();
+    return res.status(resp.status).json(json);
   } catch (err) {
-    return res.status(500).json({ error: `Proxy error: ${String(err)}` });
+    return res.status(500).json({ error: String(err) });
   }
 });
-
-
-
 
 const distDir = path.join(__dirname, "..", "dist");
 app.use(express.static(distDir, {
