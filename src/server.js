@@ -1,34 +1,48 @@
-// server.js - tiny mock WS backend for /api/voicechat
+﻿// server.js - express + websocket server that also serves the Vite frontend
 import http from "http";
 import express from "express";
 import { WebSocketServer } from "ws";
-import 'dotenv/config';
+import "dotenv/config";
 import path from "path";
+import fs from "fs";
 import { fileURLToPath } from "url";
 
-// __dirname in ESM
+// Resolve filesystem helpers in ESM context
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+const rootDir = path.join(__dirname, "..");
+const distDir = path.join(rootDir, "dist");
+
+function resolveNodeEnv() {
+  if (process.env.NODE_ENV) return process.env.NODE_ENV;
+  return fs.existsSync(distDir) ? "production" : "development";
+}
+
+const resolvedEnv = resolveNodeEnv();
+process.env.NODE_ENV = resolvedEnv;
+const isProd = resolvedEnv === "production";
+console.log(`[server] Starting in ${resolvedEnv} mode`);
 
 const app = express();
-// parse JSON bodies for API routes
 app.use(express.json());
+
 // Minimal CORS for local development (not needed in prod same-origin)
 app.use((req, res, next) => {
-  if (process.env.NODE_ENV !== "production") {
-    res.setHeader('Access-Control-Allow-Origin', '*');
+  if (!isProd) {
+    res.setHeader("Access-Control-Allow-Origin", "*");
   }
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
-  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
 });
+
 const server = http.createServer(app);
 const wss = new WebSocketServer({ noServer: true });
 
 app.get("/health", (_, res) => res.send("ok"));
 
-// NEW: Proxy endpoint for Dify Chatflow (Advanced Chat)
+// Proxy endpoint for Dify Chatflow (Advanced Chat)
 app.post("/api/chat", async (req, res) => {
   const apiKey = process.env.DIFY_API_KEY;
   if (!apiKey) return res.status(500).json({ error: "DIFY_API_KEY not set" });
@@ -52,7 +66,6 @@ app.post("/api/chat", async (req, res) => {
     const base = rawBase.replace(/\/v1\/?$/, "");
     const url = `${base}/v1/chat-messages`; // Chatflow endpoint
 
-    // Log what we’re about to call
     console.log("Proxying ->", url, "status: pending");
     console.log("Payload:", JSON.stringify(body));
 
@@ -60,16 +73,14 @@ app.post("/api/chat", async (req, res) => {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "Authorization": `Bearer ${apiKey}`,
+        Authorization: `Bearer ${apiKey}`,
       },
       body: JSON.stringify(body),
     });
 
-    // Read as text first so we can handle HTML/JSON safely
     const text = await upstream.text();
     const type = upstream.headers.get("content-type") || "";
 
-    // If JSON, relay JSON. If not, wrap the text so the client never explodes.
     if (type.includes("application/json")) {
       return res.status(upstream.status).type("application/json").send(text);
     } else {
@@ -86,22 +97,59 @@ app.post("/api/chat", async (req, res) => {
   }
 });
 
-
-const distDir = path.join(__dirname, "..", "dist");
-app.use(express.static(distDir, {
-  setHeaders(res, filePath) {
-    if (/\.(js|css|png|jpg|jpeg|gif|svg|webp|ico)$/.test(filePath)) {
-      res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
-    } else {
-      res.setHeader("Cache-Control", "no-cache");
+async function configureFrontend() {
+  if (isProd) {
+    if (!fs.existsSync(distDir)) {
+      console.warn("Static build not found at " + distDir + ". Run \"npm run build\" before starting the server in production.");
+      return;
     }
-  },
-}));
 
-// ✅ Express 5–compatible SPA fallback that skips /api
-app.get(/^\/(?!api).*/, (req, res) => {
-  res.sendFile(path.join(distDir, "index.html"));
-});
+    app.use(
+      express.static(distDir, {
+        setHeaders(res, filePath) {
+          if (/\.(js|css|png|jpg|jpeg|gif|svg|webp|ico)$/.test(filePath)) {
+            res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+          } else {
+            res.setHeader("Cache-Control", "no-cache");
+          }
+        },
+      })
+    );
+
+    app.get(/^\/(?!api).*/, (req, res) => {
+      res.sendFile(path.join(distDir, "index.html"));
+    });
+
+    console.log(`[server] Serving static frontend from ${distDir}`);
+    return;
+  }
+
+  const { createServer: createViteServer } = await import("vite");
+  const vite = await createViteServer({
+    root: rootDir,
+    server: {
+      middlewareMode: true,
+    },
+    appType: "spa",
+  });
+
+  app.use(vite.middlewares);
+
+  app.use(/^\/(?!api).*/, async (req, res, next) => {
+    try {
+      const template = await fs.promises.readFile(path.join(rootDir, "index.html"), "utf-8");
+      const html = await vite.transformIndexHtml(req.originalUrl, template);
+      res.status(200).set({ "Content-Type": "text/html" }).end(html);
+    } catch (err) {
+      vite.ssrFixStacktrace?.(err);
+      next(err);
+    }
+  });
+
+  console.log("[server] Vite dev middleware enabled");
+}
+
+await configureFrontend();
 
 server.on("upgrade", (req, socket, head) => {
   if (req.url?.startsWith("/api/voicechat")) {
@@ -139,13 +187,21 @@ wss.on("connection", (ws) => {
     try {
       const msg = JSON.parse(data.toString());
 
-      // Typing mode: accept text messages from client
       if (msg.type === "text") {
-        // Echo a partial_answer then final answer to simulate processing
-        ws.send(JSON.stringify({ type: "partial_answer", text: msg.text.slice(0, 20) + (msg.text.length > 20 ? '…' : '') }));
+        ws.send(
+          JSON.stringify({
+            type: "partial_answer",
+            text: msg.text.slice(0, 20) + (msg.text.length > 20 ? "..." : ""),
+          })
+        );
         setTimeout(() => {
           ws.send(JSON.stringify({ type: "final_answer", text: `Reply to: ${msg.text}` }));
-          ws.send(JSON.stringify({ type: "tts_url", url: "https://actions.google.com/sounds/v1/alarms/beep_short.ogg" }));
+          ws.send(
+            JSON.stringify({
+              type: "tts_url",
+              url: "https://actions.google.com/sounds/v1/alarms/beep_short.ogg",
+            })
+          );
           ws.send(JSON.stringify({ type: "done" }));
         }, 250);
         return;
@@ -157,44 +213,51 @@ wss.on("connection", (ws) => {
         i = 0;
         stopStreaming();
 
-        // STREAM partial transcripts while recording
         partialTimer = setInterval(() => {
           if (!collecting) return;
           if (i < parts.length) {
-            ws.send(JSON.stringify({
-              type: "partial_transcript",
-              text: parts.slice(0, i + 1).join("")
-            }));
+            ws.send(
+              JSON.stringify({
+                type: "partial_transcript",
+                text: parts.slice(0, i + 1).join(""),
+              })
+            );
             i++;
           } else {
-            // Loop a bit or hold last partial; we’ll finalize on stop
-            ws.send(JSON.stringify({
-              type: "partial_transcript",
-              text: parts.join("")
-            }));
+            ws.send(
+              JSON.stringify({
+                type: "partial_transcript",
+                text: parts.join(""),
+              })
+            );
           }
         }, 150);
-      }
-
-      else if (msg.type === "stop") {
+      } else if (msg.type === "stop") {
         collecting = false;
         stopStreaming();
 
-        // Final user text
         const finalText = parts.join("");
         ws.send(JSON.stringify({ type: "final_transcript", text: finalText }));
 
-        // Assistant streams, then finalizes
-        ws.send(JSON.stringify({ type: "partial_answer", text: "We can walk you through a few options…" }));
+        ws.send(
+          JSON.stringify({
+            type: "partial_answer",
+            text: "We can walk you through a few options...",
+          })
+        );
         setTimeout(() => {
-          ws.send(JSON.stringify({
-            type: "final_answer",
-            text: "Here are a few common programs...\n• Conventional\n• FHA\n• VA\n• Cash-out refi"
-          }));
-          ws.send(JSON.stringify({
-            type: "tts_url",
-            url: "https://actions.google.com/sounds/v1/cartoon/wood_plank_flicks.ogg"
-          }));
+          ws.send(
+            JSON.stringify({
+              type: "final_answer",
+              text: "Here are a few common programs...\n- Conventional\n- FHA\n- VA\n- Cash-out refi",
+            })
+          );
+          ws.send(
+            JSON.stringify({
+              type: "tts_url",
+              url: "https://actions.google.com/sounds/v1/cartoon/wood_plank_flicks.ogg",
+            })
+          );
           ws.send(JSON.stringify({ type: "done" }));
         }, 400);
       }
@@ -202,15 +265,14 @@ wss.on("connection", (ws) => {
   });
 });
 
-
 const PORT = process.env.PORT ? Number(process.env.PORT) : 3001;
 server.listen(PORT, () => console.log(`Mock WS server on http://localhost:${PORT}`));
 
-server.on('error', (err) => {
-  if (err.code === 'EADDRINUSE') {
+server.on("error", (err) => {
+  if (err.code === "EADDRINUSE") {
     console.error(`Port ${PORT} already in use. If another instance is running, stop it or set PORT to a different value.`);
     process.exit(1);
   }
-  console.error('Server error:', err);
+  console.error("Server error:", err);
   process.exit(1);
 });

@@ -4,10 +4,10 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "dev": "vite",
-    "server": "node src/server.js",
-    "dev:all": "concurrently -k -n VITE,WS -c cyan,magenta \"npm run dev\" \"npm run server\"",
-    "build": "vite build"
+    "dev": "node src/server.js",
+    "build": "vite build",
+    "start": "node src/server.js",
+    "preview": "npm run build && node src/server.js"
   },
   "dependencies": {
     "express": "^5.1.0",
