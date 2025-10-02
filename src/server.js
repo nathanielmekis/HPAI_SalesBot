@@ -5,6 +5,7 @@ import { WebSocketServer } from "ws";
 import "dotenv/config";
 import path from "path";
 import fs from "fs";
+import multer from "multer";
 import { fileURLToPath } from "url";
 
 // Resolve filesystem helpers in ESM context
@@ -24,7 +25,7 @@ const isProd = resolvedEnv === "production";
 console.log(`[server] Starting in ${resolvedEnv} mode`);
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: "10mb" }));
 
 // Minimal CORS for local development (not needed in prod same-origin)
 app.use((req, res, next) => {
@@ -42,7 +43,9 @@ const wss = new WebSocketServer({ noServer: true });
 
 app.get("/health", (_, res) => res.send("ok"));
 
-// Proxy endpoint for Dify Chatflow (Advanced Chat)
+/* -----------------------------
+   1) Proxy endpoint for Dify Chatflow (Advanced Chat)
+--------------------------------*/
 app.post("/api/chat", async (req, res) => {
   const apiKey = process.env.DIFY_API_KEY;
   if (!apiKey) return res.status(500).json({ error: "DIFY_API_KEY not set" });
@@ -61,13 +64,9 @@ app.post("/api/chat", async (req, res) => {
       response_mode: response_mode || "blocking",
     };
 
-    // Normalize base URL: ensure NO trailing /v1 (we add it)
     const rawBase = process.env.DIFY_BASE_URL || "https://agent.helport.ai";
     const base = rawBase.replace(/\/v1\/?$/, "");
-    const url = `${base}/v1/chat-messages`; // Chatflow endpoint
-
-    console.log("Proxying ->", url, "status: pending");
-    console.log("Payload:", JSON.stringify(body));
+    const url = `${base}/v1/chat-messages`;
 
     const upstream = await fetch(url, {
       method: "POST",
@@ -97,10 +96,77 @@ app.post("/api/chat", async (req, res) => {
   }
 });
 
+/* -----------------------------
+   2) ASR proxies (Upload + Run)
+   POST /api/asr/upload → /v1/files/upload (multipart/form-data)
+   POST /api/asr/run    → /v1/workflows/run (application/json)
+--------------------------------*/
+const ASR_BASE = (process.env.ASR_BASE_URL || "https://agent.helport.ai").replace(/\/v1\/?$/, "");
+const ASR_KEY = process.env.ASR_API_KEY; // e.g. "app-9IZw8EwwtwJbdOwyGIEzUNnJ"
+if (!ASR_KEY) console.warn("[server] ASR_API_KEY not set — /api/asr/* will 500");
+
+const upload = multer(); // in-memory
+
+// Upload audio file and return {id,...} as-is
+app.post("/api/asr/upload", upload.single("file"), async (req, res) => {
+  try {
+    if (!ASR_KEY) return res.status(500).json({ error: "ASR_API_KEY not set" });
+    if (!req.file) return res.status(400).json({ error: "Missing 'file' field" });
+
+    const form = new FormData();
+    // keep compatibility with your Postman example
+    if (req.body?.user) form.append("user", req.body.user);
+    const filename = req.file.originalname || "recording.webm";
+    const mime = req.file.mimetype || "application/octet-stream";
+    // Node 18+: FormData accepts Blob with filename
+    const blob = new Blob([req.file.buffer], { type: mime });
+    form.append("file", blob, filename);
+
+    const r = await fetch(`${ASR_BASE}/v1/files/upload`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${ASR_KEY}` },
+      body: form,
+    });
+
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) return res.status(r.status).json(j || { error: "Upload failed" });
+    res.json(j);
+  } catch (e) {
+    console.error("ASR upload error:", e);
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+// Run ASR workflow and return upstream JSON (expects body per your sample)
+app.post("/api/asr/run", async (req, res) => {
+  try {
+    if (!ASR_KEY) return res.status(500).json({ error: "ASR_API_KEY not set" });
+    const r = await fetch(`${ASR_BASE}/v1/workflows/run`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${ASR_KEY}`,
+      },
+      body: JSON.stringify(req.body || {}),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) return res.status(r.status).json(j || { error: "ASR run failed" });
+    res.json(j);
+  } catch (e) {
+    console.error("ASR run error:", e);
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+/* -----------------------------
+   3) Frontend (Vite dev or static prod)
+--------------------------------*/
 async function configureFrontend() {
   if (isProd) {
     if (!fs.existsSync(distDir)) {
-      console.warn("Static build not found at " + distDir + ". Run \"npm run build\" before starting the server in production.");
+      console.warn(
+        'Static build not found at ' + distDir + '. Run "npm run build" before starting the server in production.'
+      );
       return;
     }
 
@@ -112,7 +178,7 @@ async function configureFrontend() {
           } else {
             res.setHeader("Cache-Control", "no-cache");
           }
-        },
+        }
       })
     );
 
@@ -127,9 +193,7 @@ async function configureFrontend() {
   const { createServer: createViteServer } = await import("vite");
   const vite = await createViteServer({
     root: rootDir,
-    server: {
-      middlewareMode: true,
-    },
+    server: { middlewareMode: true },
     appType: "spa",
   });
 
@@ -148,9 +212,13 @@ async function configureFrontend() {
 
   console.log("[server] Vite dev middleware enabled");
 }
-
 await configureFrontend();
 
+/* -----------------------------
+   4) WebSocket (kept minimal/no-op)
+   - Keeps session id
+   - Echoes a simple lifecycle; no fake transcripts anymore
+--------------------------------*/
 server.on("upgrade", (req, socket, head) => {
   if (req.url?.startsWith("/api/voicechat")) {
     wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
@@ -163,114 +231,40 @@ wss.on("connection", (ws) => {
   const sessionId = Math.random().toString(36).slice(2);
   ws.send(JSON.stringify({ type: "session", session_id: sessionId }));
 
-  let collecting = false;
-  let audioBytes = 0;
-  let partialTimer = null;
-  const parts = ["What ", "programs ", "can you ", "offer me ", "today?"];
-  let i = 0;
-
-  function stopStreaming() {
-    if (partialTimer) {
-      clearInterval(partialTimer);
-      partialTimer = null;
-    }
-  }
-
-  ws.on("close", () => stopStreaming());
-
   ws.on("message", (data, isBinary) => {
-    if (isBinary) {
-      if (collecting) audioBytes += data.length;
-      return;
-    }
-
+    if (isBinary) return; // we no longer process audio over WS
     try {
       const msg = JSON.parse(data.toString());
-
       if (msg.type === "text") {
-        ws.send(
-          JSON.stringify({
-            type: "partial_answer",
-            text: msg.text.slice(0, 20) + (msg.text.length > 20 ? "..." : ""),
-          })
-        );
+        // simple echo to not break any dev tool around WS
+        ws.send(JSON.stringify({ type: "partial_answer", text: (msg.text || "").slice(0, 20) }));
         setTimeout(() => {
-          ws.send(JSON.stringify({ type: "final_answer", text: `Reply to: ${msg.text}` }));
-          ws.send(
-            JSON.stringify({
-              type: "tts_url",
-              url: "https://actions.google.com/sounds/v1/alarms/beep_short.ogg",
-            })
-          );
+          ws.send(JSON.stringify({ type: "final_answer", text: `Reply to: ${msg.text || ""}` }));
           ws.send(JSON.stringify({ type: "done" }));
-        }, 250);
-        return;
-      }
-
-      if (msg.type === "start") {
-        collecting = true;
-        audioBytes = 0;
-        i = 0;
-        stopStreaming();
-
-        partialTimer = setInterval(() => {
-          if (!collecting) return;
-          if (i < parts.length) {
-            ws.send(
-              JSON.stringify({
-                type: "partial_transcript",
-                text: parts.slice(0, i + 1).join(""),
-              })
-            );
-            i++;
-          } else {
-            ws.send(
-              JSON.stringify({
-                type: "partial_transcript",
-                text: parts.join(""),
-              })
-            );
-          }
         }, 150);
-      } else if (msg.type === "stop") {
-        collecting = false;
-        stopStreaming();
-
-        const finalText = parts.join("");
-        ws.send(JSON.stringify({ type: "final_transcript", text: finalText }));
-
-        ws.send(
-          JSON.stringify({
-            type: "partial_answer",
-            text: "We can walk you through a few options...",
-          })
-        );
-        setTimeout(() => {
-          ws.send(
-            JSON.stringify({
-              type: "final_answer",
-              text: "Here are a few common programs...\n- Conventional\n- FHA\n- VA\n- Cash-out refi",
-            })
-          );
-          ws.send(
-            JSON.stringify({
-              type: "tts_url",
-              url: "https://actions.google.com/sounds/v1/cartoon/wood_plank_flicks.ogg",
-            })
-          );
-          ws.send(JSON.stringify({ type: "done" }));
-        }, 400);
       }
-    } catch {}
+      if (msg.type === "start") {
+        // acknowledge only
+        ws.send(JSON.stringify({ type: "info", text: "WS accepted; audio is handled by REST /api/asr/* now." }));
+      }
+      if (msg.type === "stop") {
+        ws.send(JSON.stringify({ type: "done" }));
+      }
+    } catch { /* ignore */ }
   });
 });
 
+/* -----------------------------
+   5) Boot
+--------------------------------*/
 const PORT = process.env.PORT ? Number(process.env.PORT) : 3001;
-server.listen(PORT, () => console.log(`Mock WS server on http://localhost:${PORT}`));
+server.listen(PORT, () => console.log(`Server running on http://localhost:${PORT}`));
 
 server.on("error", (err) => {
   if (err.code === "EADDRINUSE") {
-    console.error(`Port ${PORT} already in use. If another instance is running, stop it or set PORT to a different value.`);
+    console.error(
+      `Port ${PORT} already in use. If another instance is running, stop it or set PORT to a different value.`
+    );
     process.exit(1);
   }
   console.error("Server error:", err);

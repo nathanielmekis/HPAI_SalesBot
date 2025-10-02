@@ -49,6 +49,9 @@ export default function App() {
   const AVATAR_URL = "/toby.png"; // lives in /public
   const START_FRESH_ON_LOAD = true;
 
+  const chunksRef = useRef([]);
+  const ASR_USER = "XBOT_DEV"; 
+
 
   useEffect(() => {
     if (!START_FRESH_ON_LOAD) return;
@@ -78,99 +81,68 @@ export default function App() {
     };
   }, []);
 
-  // ----- WebSocket (optional) -----
-  const ensureSocket = async () => {
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) return true;
 
-    return new Promise((resolve) => {
-      let url = WS_URL;
-      // Auto-point to local mock if no proxy set
-      if (WS_URL === "/api/voicechat" && (location.hostname === "localhost" || location.hostname === "127.0.0.1")) {
-        url = "ws://localhost:3001/api/voicechat";
+  async function handleVoiceClip() {
+    try {
+      const parts = chunksRef.current;
+      chunksRef.current = [];
+      if (!parts.length) { setStatus("Ready"); return; }
+  
+      // 生成 Blob（浏览器实际可能是 webm/opus；后端能吃就行）
+      const blob = new Blob(parts, { type: parts[0]?.type || "audio/webm" });
+  
+      setStatus("Uploading…");
+      const fileId = await asrUpload(blob);     // ① 上传，拿 id
+      setStatus("Transcribing…");
+      const text = await asrRun(fileId);        // ② 调 ASR，拿文本
+  
+      // 把识别文本当作用户发言插入，然后复用你现有的 runChat
+      if (text && text.trim()) {
+        setMessages(m => [...m, { role: "user", text }]);
+        setStatus("Thinking…");
+        await runChat(text);
+      } else {
+        setMessages(m => [...m, { role: "assistant", text: "ASR returned empty text." }]);
+        setStatus("Ready");
       }
+    } catch (e) {
+      setMessages(m => [...m, { role: "assistant", text: `ASR error: ${e?.message || e}` }]);
+      setStatus("Ready");
+    }
+  }
 
-      let ws;
-      try {
-        ws = new WebSocket(url);
-      } catch (e) {
-        console.warn("WS create failed:", e);
-        setConnected(false);
-        return resolve(false);
-      }
-      wsRef.current = ws;
-
-      ws.onopen = () => { setConnected(true); resolve(true); };
-      ws.onclose = () => setConnected(false);
-      ws.onerror = () => { setConnected(false); resolve(false); };
-      ws.onmessage = (ev) => {
-        if (typeof ev.data !== "string") return;
-        try {
-          const msg = JSON.parse(ev.data);
-          switch (msg.type) {
-            case "session": setSessionId(msg.session_id || ""); break;
-            case "partial_transcript": {
-                setStatus("Listening…");
-                setMessages((m) => {
-                  const copy = m.slice();
-                  const last = copy[copy.length - 1];
-                  // If there's no provisional user bubble yet, add one
-                  if (!last || last.role !== "user" || !last.provisional) {
-                    copy.push({ role: "user", text: msg.text || "…", provisional: true });
-                  } else {
-                    // Update the existing provisional bubble
-                    copy[copy.length - 1] = { ...last, text: msg.text || "…" };
-                  }
-                  return copy;
-                });
-                break;
-              }
-            case "final_transcript": {
-              setMessages((m) => {
-                const copy = m.slice();
-                const last = copy[copy.length - 1];
-                if (last && last.role === "user" && last.provisional) {
-                  // Finalize the provisional
-                  copy[copy.length - 1] = { role: "user", text: msg.text || last.text };
-                } else {
-                  // Fallback: if no provisional was present, append a new final
-                  copy.push({ role: "user", text: msg.text });
-                }
-                return copy;
-              });
-              break;
-            }
-            case "partial_answer":
-              setStatus("Answering…");
-              setMessages(m => {
-                const last = m[m.length - 1];
-                if (!last || last.role === "user") return [...m, { role: "assistant", text: msg.text || "…" }];
-                const copy = m.slice();
-                copy[copy.length - 1] = { role: "assistant", text: msg.text || "…" };
-                return copy;
-              });
-              break;
-            case "final_answer":
-              setMessages(m => {
-                const copy = m.slice();
-                for (let i = copy.length - 1; i >= 0; i--) {
-                  if (copy[i].role === "assistant") { copy[i] = { role: "assistant", text: msg.text }; break; }
-                }
-                return copy;
-              });
-              setStatus("Ready");
-              break;
-            case "tts_url":
-              if (audioRef.current) {
-                audioRef.current.src = msg.url;
-                audioRef.current.play().catch(() => {});
-              }
-              break;
-            case "done": setStatus("Ready"); break;
-          }
-        } catch {}
-      };
+  async function asrUpload(blob) {
+    // POST /api/asr/upload  -> 透传到 https://agent.helport.ai/v1/files/upload
+    const form = new FormData();
+    form.append("user", "abc123"); // 你示例里的字段
+    form.append("file", new File([blob], "recording.webm", { type: blob.type || "audio/webm" }));
+  
+    const resp = await fetch(`${API_BASE || ""}/api/asr/upload`, { method: "POST", body: form });
+    if (!resp.ok) throw new Error(`Upload failed: ${resp.status}`);
+    const json = await resp.json();
+    const fileId = json?.id;
+    if (!fileId) throw new Error("Upload OK but no file id.");
+    return fileId;
+  }
+  
+  async function asrRun(fileId) {
+    // POST /api/asr/run -> 透传到 https://agent.helport.ai/v1/workflows/run
+    const payload = {
+      inputs: { speech: { transfer_method: "local_file", upload_file_id: fileId, type: "audio" } },
+      response_mode: "blocking",
+      user: ASR_USER,
+    };
+    const resp = await fetch(`${API_BASE || ""}/api/asr/run`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
     });
-  };
+    if (!resp.ok) throw new Error(`ASR failed: ${resp.status}`);
+    const json = await resp.json();
+    return json?.data?.outputs?.text || "";
+  }
+  
+  
 
   // ----- Start mic + (optionally) WS -----
   const startConversation = async () => {
@@ -186,28 +158,13 @@ export default function App() {
 
       setRecording(true);
       setStatus("Listening…");
-
-      // Connect WS in the background (optional)
-      const ok = await ensureSocket();
-      if (ok && wsRef.current?.readyState === WebSocket.OPEN) {
-        wsRef.current.send(JSON.stringify({
-          type: "start",
-          voice_id: "top-sales-voice-001",
-          temperature: 0.2,
-          session_id: sessionId || undefined
-        }));
-      }
+      chunksRef.current = [];
 
       mr.ondataavailable = async (e) => {
-        if (e.data.size && wsRef.current?.readyState === WebSocket.OPEN) {
-          wsRef.current.send(await e.data.arrayBuffer());
-        }
+        if (e.data && e.data.size) chunksRef.current.push(e.data);
       };
       mr.onstop = () => {
-        if (wsRef.current?.readyState === WebSocket.OPEN) {
-          wsRef.current.send(JSON.stringify({ type: "stop" }));
-        }
-        setStatus("Thinking…");
++       void handleVoiceClip();
       };
 
       mr.start(220); // low-latency chunks
@@ -217,6 +174,7 @@ export default function App() {
       setRecording(false);
       // Be sure to stop any tracks if partially opened
       streamRef.current?.getTracks()?.forEach(t => t.stop());
+      setMode("type"); // switch to type mode on mic fail
     }
   };
 
@@ -307,7 +265,6 @@ export default function App() {
     streamRef.current?.getTracks()?.forEach(t => t.stop());
     streamRef.current = null;
     setRecording(false);
-    setStatus("Ready");
   };
 
   // put inside your App component

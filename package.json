@@ -13,6 +13,7 @@
     "express": "^5.1.0",
     "framer-motion": "^12.23.13",
     "lucide-react": "^0.544.0",
+    "multer": "^2.0.2",
     "react": "^19.1.1",
     "react-dom": "^19.1.1",
     "ws": "^8.18.3"
