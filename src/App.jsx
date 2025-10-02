@@ -176,7 +176,14 @@ export default function App() {
       boxShadow: "0 6px 24px rgba(0,0,0,0.06)",
       overflow: "hidden",
     },
-    scroll: { height: "56vh", overflowY: "auto", padding: 20 },
+    scroll: {
+      height: "56vh",
+      overflowY: "auto",
+      padding: 20,
+      scrollbarWidth: "thin",
+      scrollbarColor: ACCENT + " rgba(0,0,0,0.08)",
+      scrollbarGutter: "stable",
+    },
     emptyText: { opacity: 0.6, fontSize: 18, textAlign: "center" },
     row: (justify) => ({ display: "flex", justifyContent: justify, marginBottom: 10 }),
     rowWithAvatar: { display: "flex", alignItems: "flex-start", gap: 0, marginBottom: 10 },
@@ -287,7 +294,7 @@ export default function App() {
       <main style={styles.cardWrap}>
         <div style={styles.card}>
           {/* Chat Scroll */}
-          <div ref={scrollerRef} style={styles.scroll}>
+          <div ref={scrollerRef} style={styles.scroll} className="chat-scroll">
             {messages.length === 0 ? (
               <div style={{ height: "100%", display: "grid", placeItems: "center" }}>
                 <div style={styles.emptyText}>
