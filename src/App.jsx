@@ -52,6 +52,52 @@ export default function App() {
   const chunksRef = useRef([]);
   const ASR_USER = "XBOT_DEV"; 
 
+  const ttsCacheRef = useRef(new Map());
+
+  async function speakText(text, lang = "en") {
+    if (!text || !audioRef.current) return;
+    try {
+      // 呈现 Speaking… 状态（不覆盖 Thinking…）
+      setStatus(s => (s.includes("Thinking") ? s : "Speaking…"));
+  
+      // 命中缓存直接播
+      let url = ttsCacheRef.current.get(text);
+      if (!url) {
+        const resp = await fetch(`${API_BASE || ""}/api/tts`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ text, text_language: lang }),
+        });
+        if (!resp.ok) throw new Error(`TTS ${resp.status}`);
+        const buf = await resp.arrayBuffer();
+        const blob = new Blob([buf], { type: resp.headers.get("content-type") || "audio/mpeg" });
+        url = URL.createObjectURL(blob);
+        ttsCacheRef.current.set(text, url);
+      }
+  
+      audioRef.current.src = url;
+      // 播放失败静默（例如用户没交互导致 autoplay 限制）
+      await audioRef.current.play().catch(() => {});
+    } catch (e) {
+      setMessages(m => [...m, { role: "assistant", text: `TTS error: ${e?.message || e}` }]);
+    } finally {
+      setStatus(s => (s.includes("Thinking") ? s : "Ready"));
+    }
+  }
+  
+  // 清理缓存（新对话时用）
+  function clearTtsCache() {
+    for (const u of ttsCacheRef.current.values()) URL.revokeObjectURL(u);
+    ttsCacheRef.current.clear();
+  }
+
+  // 结束播放恢复状态（可选）
+  useEffect(() => {
+    const a = audioRef.current; if (!a) return;
+    const onEnd = () => setStatus(s => (s.includes("Thinking") ? s : "Ready"));
+    a.addEventListener("ended", onEnd);
+    return () => a.removeEventListener("ended", onEnd);
+  }, []);
 
   useEffect(() => {
     if (!START_FRESH_ON_LOAD) return;
@@ -227,15 +273,24 @@ export default function App() {
         try { localStorage.setItem("dify_conversation_id", json.conversation_id); } catch {}
       }
 
+      const finalText = String(answer);
+      let targetIndex = -1;
       setMessages((m) => {
         const copy = m.slice();
         for (let i = copy.length - 1; i >= 0; i--) {
           if (copy[i].role === "assistant" && copy[i].provisional) {
-            copy[i] = { role: "assistant", text: String(answer) };
-            return copy;
+            copy[i] = { role: "assistant", text: finalText };
+            targetIndex = i;
+            break;
           }
         }
-        return [...m, { role: "assistant", text: String(answer) }];
+        if (targetIndex === -1) {
+          copy.push({ role: "assistant", text: finalText });
+          targetIndex = copy.length - 1;
+        }
+        // 等状态更新后再触发播放，避免竞态
+        setTimeout(() => speakText(finalText, "en"), 0);
+        return copy;
       });
       setStatus("Ready");
     } catch (err) {
@@ -289,6 +344,7 @@ export default function App() {
     } catch {}
 
     // Reset UI state
+    clearTtsCache();
     setConversationId("");
     setMessages([]);
     setStatus("Ready");
@@ -509,9 +565,29 @@ export default function App() {
                   >
                     {m.role === "assistant" && <img src={AVATAR_URL} alt="Agent" style={styles.avatar} />}
 
+                    <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
                     <div style={styles.bubble(m.role === "user", m.provisional)}>
                       {m.text}
                     </div>
+                    {m.role === "assistant" && !m.provisional && (
+                      <button
+                        onClick={() => speakText(m.text, "en")}
+                        title="Replay"
+                        style={{
+                          border: "none",
+                          background: "transparent",
+                          cursor: "pointer",
+                          display: "inline-flex",
+                          alignItems: "center",
+                          padding: 4,
+                          opacity: 0.7
+                        }}
+                        aria-label="Replay audio"
+                      >
+                        <Volume2 size={16} />
+                      </button>
+                    )}
+                  </div>
                   </motion.div>
                 ))}
               </div>

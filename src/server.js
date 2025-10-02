@@ -7,6 +7,14 @@ import path from "path";
 import fs from "fs";
 import multer from "multer";
 import { fileURLToPath } from "url";
+import { Agent } from "undici";
+/* eslint-env node */
+import process from 'node:process';
+import { Buffer } from 'node:buffer';
+
+const TTS_URL = process.env.TTS_URL || "https://69.109.187.61/gpt_api/";
+const TTS_INSECURE = process.env.TTS_INSECURE === "1"; // 自签名证书时置 1
+const ttsAgent = TTS_INSECURE ? new Agent({ connect: { rejectUnauthorized: false } }) : undefined;
 
 // Resolve filesystem helpers in ESM context
 const __filename = fileURLToPath(import.meta.url);
@@ -154,6 +162,40 @@ app.post("/api/asr/run", async (req, res) => {
     res.json(j);
   } catch (e) {
     console.error("ASR run error:", e);
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+app.post("/api/tts", async (req, res) => {
+  try {
+    const { text, text_language = "en" } = req.body || {};
+    if (!text || typeof text !== "string") {
+      return res.status(400).json({ error: "Missing 'text' string" });
+    }
+
+    const r = await fetch(TTS_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Accept": "audio/mpeg",
+      },
+      body: JSON.stringify({ text, text_language }),
+      ...(ttsAgent ? { dispatcher: ttsAgent } : {}),
+    });
+
+    if (!r.ok) {
+      const body = await r.text().catch(() => "");
+      return res.status(r.status).json({ error: "TTS upstream failed", body: body.slice(0, 400) });
+    }
+
+    const ct = r.headers.get("content-type") || "audio/mpeg"; // 可能返回 wav/mp3
+    res.setHeader("Content-Type", ct);
+    res.setHeader("Cache-Control", "no-store");
+
+    const ab = await r.arrayBuffer();
+    res.status(200).end(Buffer.from(ab));
+  } catch (e) {
+    console.error("TTS proxy error:", e);
     res.status(500).json({ error: String(e) });
   }
 });
