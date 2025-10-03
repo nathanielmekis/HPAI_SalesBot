@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from "react";
-import { color, motion } from "framer-motion";
+import { motion } from "framer-motion";
 import { Mic, Square, Volume2, Loader2, ArrowUp } from "lucide-react";
 
 // Toby Clone Bot – Helport AI
@@ -9,6 +9,56 @@ const WS_URL = import.meta.env.VITE_WS_URL || "/api/voicechat";
 const ACCENT = "#00C389";
 const BG_GRADIENT = `radial-gradient(1200px 600px at 50% -200px, rgba(0,195,137,0.14), transparent),
                      radial-gradient(800px 400px at 90% -100px, rgba(99,102,241,0.10), transparent)`;
+
+const ABBR = [
+  "U.S.", "U.K.", "e.g.", "i.e.", "etc.", "vs.",
+  "Mr.", "Mrs.", "Ms.", "Dr.", "Prof.",
+  "Inc.", "Ltd.", "Jr.", "Sr.", "St.", "No.",
+  "Jan.", "Feb.", "Mar.", "Apr.", "Jun.", "Jul.", "Aug.", "Sep.", "Sept.", "Oct.", "Nov.", "Dec.",
+];
+
+function protectAbbrDots(s) {
+  let out = s;
+  for (const a of ABBR) {
+    const safe = a.replace(/\./g, "§"); // 用 § 暂代句点
+    // 精确替换大小写匹配（简单起见用原样大小写）
+    out = out.replaceAll(a, safe);
+  }
+  return out;
+}
+function restoreAbbrDots(s) { return s.replace(/§/g, "."); }
+
+// 智能分句：在 . ! ? 后、且后面像是句首（引号/括号/大写/数字）再断
+function splitIntoSentencesSmart(text) {
+  if (!text) return [];
+  const protectedText = protectAbbrDots(text);
+  const parts = protectedText
+    .replace(/\s+/g, " ")
+    .trim()
+    .split(/(?<=[.!?])\s+(?=["'(\[]?[A-Z0-9])/); // 简洁有效的启发式
+  return parts.map(restoreAbbrDots).map(s => s.trim()).filter(Boolean);
+}
+
+// 把句子按“2–3句 / <= 400 字”打包
+function groupSentencesToChunks(sentences, { maxChars = 400, minSent = 2, maxSent = 3 } = {}) {
+  const chunks = [];
+  let cur = [];
+  let curLen = 0;
+  for (const s of sentences) {
+    const willLen = curLen + (curLen ? 1 : 0) + s.length;
+    if (cur.length >= maxSent || (cur.length >= minSent && willLen > maxChars)) {
+      chunks.push(cur.join(" "));
+      cur = [s];
+      curLen = s.length;
+    } else {
+      cur.push(s);
+      curLen = willLen;
+    }
+  }
+  if (cur.length) chunks.push(cur.join(" "));
+  return chunks;
+}
+
 
 
 // Pick a supported audio mime type (Safari prefers mp4/mpeg)
@@ -61,20 +111,23 @@ export default function App() {
       setStatus(s => (s.includes("Thinking") ? s : "Speaking…"));
   
       // 命中缓存直接播
-      let url = ttsCacheRef.current.get(text);
+      const safe = sanitizeForTTS(text);
+      let url = ttsCacheRef.current.get(safe);
       if (!url) {
         const resp = await fetch(`${API_BASE || ""}/api/tts`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ text, text_language: lang }),
+          body: JSON.stringify({ text: safe, text_language: lang }),
         });
         if (!resp.ok) throw new Error(`TTS ${resp.status}`);
         const buf = await resp.arrayBuffer();
         const blob = new Blob([buf], { type: resp.headers.get("content-type") || "audio/mpeg" });
         url = URL.createObjectURL(blob);
-        ttsCacheRef.current.set(text, url);
+        ttsCacheRef.current.set(safe, url);
       }
-  
+      
+      try { audioRef.current.pause(); } catch {}
+      try { audioRef.current.currentTime = 0; } catch {}
       audioRef.current.src = url;
       // 播放失败静默（例如用户没交互导致 autoplay 限制）
       await audioRef.current.play().catch(() => {});
@@ -90,6 +143,180 @@ export default function App() {
     for (const u of ttsCacheRef.current.values()) URL.revokeObjectURL(u);
     ttsCacheRef.current.clear();
   }
+
+  // 缓存：chunk 文本 -> { url, blob, ab(ArrayBuffer), mime }
+  const ttsObjCacheRef = useRef(new Map());
+  // 播放队列：只存 URL
+  const ttsQueueRef = useRef([]);
+  // 当前答案的分段原始音频（用于“一次性重播”合并）
+  const currentAnswerAudioRef = useRef({ key: "", items: [], mergedUrl: null });
+
+  function resetCurrentAnswerAudio(key) {
+    // 释放旧的合并 URL
+    const cur = currentAnswerAudioRef.current;
+    if (cur.mergedUrl) { URL.revokeObjectURL(cur.mergedUrl); }
+    currentAnswerAudioRef.current = { key, items: [], mergedUrl: null };
+  }
+
+  // 取/生成一个 chunk 的音频
+  async function getTtsAudioObj(chunkText, lang="en") {
+    const safe = sanitizeForTTS(chunkText);
+    const cacheKey = `${lang}::${safe}`;
+    if (ttsObjCacheRef.current.has(cacheKey)) return ttsObjCacheRef.current.get(cacheKey);
+
+    const resp = await fetch(`${API_BASE || ""}/api/tts`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: safe, text_language: lang }),
+    });
+    if (!resp.ok) throw new Error(`TTS ${resp.status}`);
+    const ab = await resp.arrayBuffer();
+    const mime = resp.headers.get("content-type") || "audio/mpeg";
+    const blob = new Blob([ab], { type: mime });
+    const url = URL.createObjectURL(blob);
+    const obj = { url, blob, ab, mime };
+    ttsObjCacheRef.current.set(cacheKey, obj);
+    return obj;
+  }
+
+  // 入队并在空闲时启动播放
+  async function enqueueAndPlay(audioUrl) {
+    ttsQueueRef.current.push(audioUrl);
+    const a = audioRef.current;
+    if (!a) return;
+    // 如果当前不在播，立刻播队首
+    if (a.paused && ttsQueueRef.current.length === 1) {
+      try { a.src = ttsQueueRef.current[0]; await a.play(); } catch {}
+    }
+  }
+
+  // 监听 ended：自动播放下一个；若队列空，恢复 Ready
+  useEffect(() => {
+    const a = audioRef.current; if (!a) return;
+    const onEnded = async () => {
+      // 播掉队首
+      ttsQueueRef.current.shift();
+      if (ttsQueueRef.current.length) {
+        try { a.src = ttsQueueRef.current[0]; await a.play(); } catch {}
+      } else {
+        setStatus(s => (s.includes("Thinking") ? s : "Ready"));
+      }
+    };
+    a.addEventListener("ended", onEnded);
+    return () => a.removeEventListener("ended", onEnded);
+  }, []);
+
+  // 主接口：长文本智能分段 → 到段即播；replay=true 时合并为单 WAV 一次性播放
+  async function speakTextSmart(fullText, lang = "en", { replay = false } = {}) {
+    const sentences = splitIntoSentencesSmart(fullText);
+    const chunks = groupSentencesToChunks(sentences, { maxChars: 400, minSent: 2, maxSent: 3 });
+
+    if (!replay) {
+      setStatus(s => (s.includes("Thinking") ? s : "Speaking…"));
+      // 顺序生成并入队；第一段到就先播
+      for (let i = 0; i < chunks.length; i++) {
+        const obj = await getTtsAudioObj(chunks[i], lang);
+        // 存到“当前答案”的原始分段（用于合并）
+        if (currentAnswerAudioRef.current.key) {
+          currentAnswerAudioRef.current.items.push({ ab: obj.ab, mime: obj.mime });
+        }
+        await enqueueAndPlay(obj.url);
+      }
+      setStatus(s => (s.includes("Thinking") ? s : "Ready"));
+      return;
+    }
+
+    // —— 重播：把所有分段合并为单个 WAV 再播 ——
+    try {
+      setStatus("Preparing…");
+      const items = currentAnswerAudioRef.current.items;
+      if (!items?.length) {
+        // 如果没有缓存（例如刷新后），退化为顺序重播
+        return speakTextSmart(fullText, lang, { replay: false });
+      }
+      // 解码每段到 PCM
+      const ctx = new (window.AudioContext || window.webkitAudioContext)();
+      const decoded = [];
+      for (const it of items) {
+        const buf = await ctx.decodeAudioData(it.ab.slice(0)); // decode mp3/wav → AudioBuffer
+        decoded.push(buf);
+      }
+      const sampleRate = decoded[0].sampleRate;
+      const channels = decoded[0].numberOfChannels;
+      // 简单假设 sampleRate/通道一致（大多数 TTS 一致）；否则可做重采样
+      let totalLen = 0;
+      for (const b of decoded) totalLen += b.length;
+
+      // 拼接到一个大的 AudioBuffer
+      const out = ctx.createBuffer(channels, totalLen, sampleRate);
+      let offset = 0;
+      for (const b of decoded) {
+        for (let ch = 0; ch < channels; ch++) {
+          out.getChannelData(ch).set(b.getChannelData(ch), offset);
+        }
+        offset += b.length;
+      }
+
+      // 导出为 WAV
+      const mergedWavBlob = audioBufferToWavBlob(out);
+      const mergedUrl = URL.createObjectURL(mergedWavBlob);
+      // 记录，避免下次再做
+      if (currentAnswerAudioRef.current.mergedUrl) URL.revokeObjectURL(currentAnswerAudioRef.current.mergedUrl);
+      currentAnswerAudioRef.current.mergedUrl = mergedUrl;
+
+      // 清空队列并一次性播放
+      ttsQueueRef.current.length = 0;
+      const a = audioRef.current;
+      if (a) {
+        a.pause();
+        a.currentTime = 0;
+        a.src = mergedUrl;
+        await a.play().catch(() => {});
+      }
+    } catch (e) {
+      setMessages(m => [...m, { role: "assistant", text: `Replay merge error: ${e?.message || e}` }]);
+    } finally {
+      setStatus("Ready");
+    }
+  }
+
+  // 把 AudioBuffer 导成 WAV（float32 → 16-bit PCM）
+  function audioBufferToWavBlob(buffer) {
+    const numCh = buffer.numberOfChannels;
+    const sampleRate = buffer.sampleRate;
+    const numFrames = buffer.length;
+    const bytesPerSample = 2; // 16-bit
+    const blockAlign = numCh * bytesPerSample;
+    const dataSize = numFrames * blockAlign;
+    const headerSize = 44;
+    const ab = new ArrayBuffer(headerSize + dataSize);
+    const dv = new DataView(ab);
+    let p = 0;
+
+    // RIFF header
+    writeStr("RIFF"); u32(headerSize + dataSize - 8);
+    writeStr("WAVE");
+    writeStr("fmt "); u32(16); u16(1); u16(numCh); u32(sampleRate); u32(sampleRate * blockAlign); u16(blockAlign); u16(16);
+    writeStr("data"); u32(dataSize);
+
+    // Interleave
+    const chData = [];
+    for (let ch = 0; ch < numCh; ch++) chData.push(buffer.getChannelData(ch));
+    for (let i = 0; i < numFrames; i++) {
+      for (let ch = 0; ch < numCh; ch++) {
+        let s = Math.max(-1, Math.min(1, chData[ch][i]));
+        s = s < 0 ? s * 0x8000 : s * 0x7FFF;
+        dv.setInt16(p, s, true); p += 2;
+      }
+    }
+    return new Blob([ab], { type: "audio/wav" });
+
+    // helpers
+    function writeStr(s){ for (let i=0;i<s.length;i++) dv.setUint8(p++, s.charCodeAt(i)); }
+    function u16(v){ dv.setUint16(p, v, true); p+=2; }
+    function u32(v){ dv.setUint32(p, v, true); p+=4; }
+  }
+
 
   // 结束播放恢复状态（可选）
   useEffect(() => {
@@ -188,6 +415,40 @@ export default function App() {
     return json?.data?.outputs?.text || "";
   }
   
+  function sanitizeForTTS(input) {
+    if (!input) return "";
+    let text = input;
+  
+    // 1) 列表项：" - " -> "• "（仅行首的短横）
+    text = text.replace(/^\s*-\s+/gm, "• ");
+  
+    // 2) 数值区间: "3-5" 或 "0.7-0.8" -> "3 to 5"
+    text = text.replace(
+      /(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)(?=\s*[%a-zA-Z]|[^\d]|$)/g,
+      "$1 to $2"
+    );
+  
+    // 3) 词内连字符: "cash-out"、"follow-up" -> "cash out"、"follow up"
+    // 仅替换 ASCII '-'，不动 U+2011/2010 等真正的连字符
+    text = text.replace(/(\p{L})-(?=\p{L})/gu, "$1 ");
+  
+    // 4) 负数（普通场景）: "-5" -> "negative 5"
+    text = text.replace(/(^|[^\d])-(\d+(?:\.\d+)?)(?![\d-])/g, "$1negative $2");
+  
+    // 4.1) 货币负数: "$-100" -> "negative $100"
+    text = text.replace(/([$€£])-(\d+(?:[\d,\.])*)/g, "negative $1$2");
+  
+    // 4.2) 负百分比: "-5%" -> "negative 5 percent"
+    text = text.replace(/-(\d+(?:\.\d+)?)\s*%/g, "negative $1 percent");
+  
+    // 5) en/em dash 读成停顿
+    text = text.replace(/[–—]/g, ", ");
+  
+    // 6) 合并空格
+    text = text.replace(/\s{2,}/g, " ").trim();
+  
+    return text;
+  }  
   
 
   // ----- Start mic + (optionally) WS -----
@@ -289,7 +550,9 @@ export default function App() {
           targetIndex = copy.length - 1;
         }
         // 等状态更新后再触发播放，避免竞态
-        setTimeout(() => speakText(finalText, "en"), 0);
+        // 重置“当前答案”的分段缓存，然后启动分段 TTS（到段即播）
+        resetCurrentAnswerAudio(finalText);
+        setTimeout(() => speakTextSmart(finalText, "en", { replay: false }), 0);
         return copy;
       });
       setStatus("Ready");
@@ -408,6 +671,7 @@ export default function App() {
       alignItems: "center",
       gap: 12,
     },
+    toggleDivider: { width: 1, height: 18, background: "rgba(0,0,0,0.08)", margin: "0 2px" },
     brand: { height: 36 },
     spacer: { marginLeft: "auto", fontSize: 12, opacity: 0.6 },
     hero: { maxWidth: 820, width: "100%", margin: "0 auto 16px", padding: "0 20px", textAlign: "center" },
@@ -571,9 +835,9 @@ export default function App() {
                     </div>
                     {m.role === "assistant" && !m.provisional && (
                       <button
-                        onClick={() => speakText(m.text, "en")}
+                        onClick={() => speakTextSmart(m.text, "en", { replay: true })}
                         title="Replay"
-                        style={{
+                        style={{  
                           border: "none",
                           background: "transparent",
                           cursor: "pointer",
