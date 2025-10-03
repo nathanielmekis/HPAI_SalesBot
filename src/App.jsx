@@ -104,6 +104,70 @@ export default function App() {
 
   const ttsCacheRef = useRef(new Map());
 
+  // 正在播放哪条消息（用文本当 key；如果你有 messageId 更好）
+  const [playingKey, setPlayingKey] = useState(null);
+  // 浏览器 audio 当前是否在播（不依赖队列长度）
+  const [isAudioPlaying, setIsAudioPlaying] = useState(false);
+
+  // 自动播放门禁（被拦截时给出“点一下启用音频”的按钮）
+  const [needsUserTap, setNeedsUserTap] = useState(false);
+
+  // 为“每条气泡缓存各自的音频分段与合并结果”
+  // Map<msgId, { items: Array<{ab:ArrayBuffer, mime:string}>, mergedUrl?: string }>
+  const messageAudioStoreRef = useRef(new Map());
+  const makeMsgId = () =>
+    (window.crypto?.randomUUID?.() ?? `m_${Date.now().toString(36)}_${Math.random().toString(36).slice(2,8)}`);
+
+  // 用一个监听替换你之前的 ended 监听（队列续播 + 状态维护）
+  useEffect(() => {
+    const a = audioRef.current; if (!a) return;
+
+    const onPlay = () => setIsAudioPlaying(true);
+    const onPause = () => setIsAudioPlaying(false);
+    const onEnded = async () => {
+      // 播完当前段，看看队列
+      ttsQueueRef?.current?.shift?.();
+      if (ttsQueueRef?.current?.length) {
+        a.src = ttsQueueRef.current[0];
+        await tryPlayElement(a);
+      } else {
+        setIsAudioPlaying(false);
+        setPlayingKey(null);
+        setStatus(s => (s.includes("Thinking") ? s : "Ready"));
+      }
+    };
+
+    a.addEventListener("play", onPlay);
+    a.addEventListener("pause", onPause);
+    a.addEventListener("ended", onEnded);
+    return () => {
+      a.removeEventListener("play", onPlay);
+      a.removeEventListener("pause", onPause);
+      a.removeEventListener("ended", onEnded);
+    };
+  }, []);
+
+  function stopSpeaking() {
+    const a = audioRef.current; if (!a) return;
+    try { a.pause(); a.currentTime = 0; } catch {}
+    if (ttsQueueRef?.current) ttsQueueRef.current.length = 0; // 清空队列（分段模式）
+    setPlayingKey(null);
+    setIsAudioPlaying(false);
+    setStatus(s => (s.includes("Thinking") ? s : "Ready"));
+  }  
+
+  async function tryPlayElement(a) {
+    try {
+      setNeedsUserTap(false);
+      await a.play();
+    } catch (e) {
+      if (e?.name === "NotAllowedError") {
+        // 被浏览器自动播放策略拒绝：提示用户点一下
+        setNeedsUserTap(true);
+      }
+    }
+  }
+
   async function speakText(text, lang = "en") {
     if (!text || !audioRef.current) return;
     try {
@@ -158,25 +222,35 @@ export default function App() {
     currentAnswerAudioRef.current = { key, items: [], mergedUrl: null };
   }
 
+  const ttsInflightRef = useRef(new Map());
+
   // 取/生成一个 chunk 的音频
   async function getTtsAudioObj(chunkText, lang="en") {
     const safe = sanitizeForTTS(chunkText);
     const cacheKey = `${lang}::${safe}`;
     if (ttsObjCacheRef.current.has(cacheKey)) return ttsObjCacheRef.current.get(cacheKey);
 
+    // 如果已有同 key 的请求在飞，直接复用同一个 Promise
+    if (ttsInflightRef.current.has(cacheKey)) return ttsInflightRef.current.get(cacheKey);
+
+    const p = (async () => {
     const resp = await fetch(`${API_BASE || ""}/api/tts`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text: safe, text_language: lang }),
-    });
-    if (!resp.ok) throw new Error(`TTS ${resp.status}`);
-    const ab = await resp.arrayBuffer();
-    const mime = resp.headers.get("content-type") || "audio/mpeg";
-    const blob = new Blob([ab], { type: mime });
-    const url = URL.createObjectURL(blob);
-    const obj = { url, blob, ab, mime };
-    ttsObjCacheRef.current.set(cacheKey, obj);
-    return obj;
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Accept": "audio/mpeg" },
+        body: JSON.stringify({ text: safe, text_language: lang }),
+      });
+      if (!resp.ok) throw new Error(`TTS ${resp.status}`);
+      const ab = await resp.arrayBuffer();
+      const mime = resp.headers.get("content-type") || "audio/mpeg";
+      const blob = new Blob([ab], { type: mime });
+      const url = URL.createObjectURL(blob);
+      const obj = { url, blob, ab, mime };
+      ttsObjCacheRef.current.set(cacheKey, obj);
+      return obj;
+    })();
+    ttsInflightRef.current.set(cacheKey, p);
+    try { return await p; }
+    finally { ttsInflightRef.current.delete(cacheKey); }
   }
 
   // 入队并在空闲时启动播放
@@ -186,39 +260,30 @@ export default function App() {
     if (!a) return;
     // 如果当前不在播，立刻播队首
     if (a.paused && ttsQueueRef.current.length === 1) {
-      try { a.src = ttsQueueRef.current[0]; await a.play(); } catch {}
+      a.src = ttsQueueRef.current[0];
+      await tryPlayElement(a);
     }
   }
 
-  // 监听 ended：自动播放下一个；若队列空，恢复 Ready
-  useEffect(() => {
-    const a = audioRef.current; if (!a) return;
-    const onEnded = async () => {
-      // 播掉队首
-      ttsQueueRef.current.shift();
-      if (ttsQueueRef.current.length) {
-        try { a.src = ttsQueueRef.current[0]; await a.play(); } catch {}
-      } else {
-        setStatus(s => (s.includes("Thinking") ? s : "Ready"));
-      }
-    };
-    a.addEventListener("ended", onEnded);
-    return () => a.removeEventListener("ended", onEnded);
-  }, []);
 
   // 主接口：长文本智能分段 → 到段即播；replay=true 时合并为单 WAV 一次性播放
-  async function speakTextSmart(fullText, lang = "en", { replay = false } = {}) {
+  async function speakTextSmart(fullText, lang = "en", { replay = false, msgId } = {}) {
     const sentences = splitIntoSentencesSmart(fullText);
     const chunks = groupSentencesToChunks(sentences, { maxChars: 400, minSent: 2, maxSent: 3 });
 
     if (!replay) {
       setStatus(s => (s.includes("Thinking") ? s : "Speaking…"));
+      // 为该消息准备缓存容器
+      if (msgId && !messageAudioStoreRef.current.has(msgId)) {
+        messageAudioStoreRef.current.set(msgId, { items: [], mergedUrl: null });
+      }
       // 顺序生成并入队；第一段到就先播
       for (let i = 0; i < chunks.length; i++) {
         const obj = await getTtsAudioObj(chunks[i], lang);
         // 存到“当前答案”的原始分段（用于合并）
-        if (currentAnswerAudioRef.current.key) {
-          currentAnswerAudioRef.current.items.push({ ab: obj.ab, mime: obj.mime });
+        if (msgId) {
+          const entry = messageAudioStoreRef.current.get(msgId);
+          entry.items.push({ ab: obj.ab, mime: obj.mime });
         }
         await enqueueAndPlay(obj.url);
       }
@@ -226,16 +291,28 @@ export default function App() {
       return;
     }
 
-    // —— 重播：把所有分段合并为单个 WAV 再播 ——
+    // —— 重播：按该消息 id 的分段合并为单个 WAV 再播 ——
     try {
       setStatus("Preparing…");
-      const items = currentAnswerAudioRef.current.items;
-      if (!items?.length) {
-        // 如果没有缓存（例如刷新后），退化为顺序重播
-        return speakTextSmart(fullText, lang, { replay: false });
+      const entry = msgId ? messageAudioStoreRef.current.get(msgId) : null;
+      const items = entry?.items ?? [];
+      if (!items.length) {
+        // 没缓存（例如刷新后），退化为顺序重播并重新缓存
+        return speakTextSmart(fullText, lang, { replay: false, msgId });
       }
-      // 解码每段到 PCM
+      if (entry.mergedUrl) {
+        // 已经合并过，直接播
+        ttsQueueRef.current.length = 0;
+        const a = audioRef.current;
+        if (a) {
+          a.pause(); a.currentTime = 0; a.src = entry.mergedUrl;
+          await tryPlayElement(a);
+        }
+        setStatus("Ready");
+        return;
+      }
       const ctx = new (window.AudioContext || window.webkitAudioContext)();
+      try { await ctx.resume?.(); } catch {}
       const decoded = [];
       for (const it of items) {
         const buf = await ctx.decodeAudioData(it.ab.slice(0)); // decode mp3/wav → AudioBuffer
@@ -261,8 +338,8 @@ export default function App() {
       const mergedWavBlob = audioBufferToWavBlob(out);
       const mergedUrl = URL.createObjectURL(mergedWavBlob);
       // 记录，避免下次再做
-      if (currentAnswerAudioRef.current.mergedUrl) URL.revokeObjectURL(currentAnswerAudioRef.current.mergedUrl);
-      currentAnswerAudioRef.current.mergedUrl = mergedUrl;
+      if (entry.mergedUrl) URL.revokeObjectURL(entry.mergedUrl);
+      entry.mergedUrl = mergedUrl;
 
       // 清空队列并一次性播放
       ttsQueueRef.current.length = 0;
@@ -271,7 +348,7 @@ export default function App() {
         a.pause();
         a.currentTime = 0;
         a.src = mergedUrl;
-        await a.play().catch(() => {});
+        await tryPlayElement(a);
       }
     } catch (e) {
       setMessages(m => [...m, { role: "assistant", text: `Replay merge error: ${e?.message || e}` }]);
@@ -316,15 +393,6 @@ export default function App() {
     function u16(v){ dv.setUint16(p, v, true); p+=2; }
     function u32(v){ dv.setUint32(p, v, true); p+=4; }
   }
-
-
-  // 结束播放恢复状态（可选）
-  useEffect(() => {
-    const a = audioRef.current; if (!a) return;
-    const onEnd = () => setStatus(s => (s.includes("Thinking") ? s : "Ready"));
-    a.addEventListener("ended", onEnd);
-    return () => a.removeEventListener("ended", onEnd);
-  }, []);
 
   useEffect(() => {
     if (!START_FRESH_ON_LOAD) return;
@@ -470,9 +538,7 @@ export default function App() {
       mr.ondataavailable = async (e) => {
         if (e.data && e.data.size) chunksRef.current.push(e.data);
       };
-      mr.onstop = () => {
-+       void handleVoiceClip();
-      };
+      mr.onstop = () => { void handleVoiceClip(); };
 
       mr.start(220); // low-latency chunks
     } catch (err) {
@@ -540,19 +606,22 @@ export default function App() {
         const copy = m.slice();
         for (let i = copy.length - 1; i >= 0; i--) {
           if (copy[i].role === "assistant" && copy[i].provisional) {
-            copy[i] = { role: "assistant", text: finalText };
+            const id = makeMsgId();
+            copy[i] = { role: "assistant", text: finalText, id };
+            // 立刻开始对该消息做分段 TTS（到段即播），并把分段缓存到该 id 下
+            setPlayingKey(id);
+            setTimeout(() => speakTextSmart(finalText, "en", { replay: false, msgId: id }), 0);
             targetIndex = i;
             break;
           }
         }
         if (targetIndex === -1) {
-          copy.push({ role: "assistant", text: finalText });
+          const id = makeMsgId();
+          copy.push({ role: "assistant", text: finalText, id });
+          setPlayingKey(id);
+          setTimeout(() => speakTextSmart(finalText, "en", { replay: false, msgId: id }), 0);
           targetIndex = copy.length - 1;
         }
-        // 等状态更新后再触发播放，避免竞态
-        // 重置“当前答案”的分段缓存，然后启动分段 TTS（到段即播）
-        resetCurrentAnswerAudio(finalText);
-        setTimeout(() => speakTextSmart(finalText, "en", { replay: false }), 0);
         return copy;
       });
       setStatus("Ready");
@@ -607,11 +676,75 @@ export default function App() {
     } catch {}
 
     // Reset UI state
+    stopSpeaking();
     clearTtsCache();
+    // 释放每条消息的合并 URL，避免内存泄露
+    for (const entry of messageAudioStoreRef.current.values()) {
+      if (entry?.mergedUrl) URL.revokeObjectURL(entry.mergedUrl);
+    }
+    messageAudioStoreRef.current.clear();
     setConversationId("");
     setMessages([]);
     setStatus("Ready");
   };
+
+  // ===== Derived gating for CTA =====
+  const hasProvisionalAssistant = messages.some(
+    (m) => m.role === "assistant" && m.provisional
+  );
+
+  // “文字还没 Ready？”
+  const isThinking =
+    hasProvisionalAssistant ||
+    /Thinking|Chatflow|Uploading|Transcribing/i.test(status);
+
+  // “音频还在说？”
+  const isSpeaking =
+    isAudioPlaying ||
+    needsUserTap ||
+    /Speaking|Preparing/i.test(status);
+
+  // 统一生成 Voice CTA 的渲染数据
+  const voiceCta = (() => {
+    if (recording) {
+      return {
+        label: "End conversation",
+        onClick: endConversation,
+        disabled: false,
+        danger: true,
+        icon: <Square size={16} />,
+        aria: "End conversation",
+      };
+    }
+    if (isThinking) {
+      return {
+        label: "Thinking",
+        onClick: undefined,
+        disabled: true,
+        danger: false,
+        icon: <Loader2 size={16} className="animate-spin" />,
+        aria: "Thinking… please wait",
+      };
+    }
+    if (isSpeaking) {
+      return {
+        label: "Speaking",
+        onClick: undefined,
+        disabled: true,
+        danger: false,
+        icon: <Volume2 size={16} />,
+        aria: "Speaking… please wait",
+      };
+    }
+    return {
+      label: "Start conversation",
+      onClick: startConversation,
+      disabled: false,
+      danger: false,
+      icon: <Mic size={16} />,
+      aria: "Start conversation",
+    };
+  })();
 
   // ====== NEW: minimal helpers to meet your two UI requirements ======
   // Derived status: hide "Ready/Listening" when in Type mode; only show when thinking
@@ -721,6 +854,11 @@ export default function App() {
       cursor: "pointer",
       boxShadow: "0 4px 12px rgba(0,0,0,0.12)",
     }),
+    ctaDisabled: {
+      opacity: 0.5,
+      cursor: "not-allowed",
+      filter: "grayscale(15%)",
+    },    
     status: { fontSize: 12, opacity: 0.7, display: "inline-flex", alignItems: "center", gap: 6 },
     footer: { maxWidth: 1100, width: "100%", margin: "0 auto", padding: "32px 20px", textAlign: "center", fontSize: 12, opacity: 0.6 },
 
@@ -821,8 +959,7 @@ export default function App() {
             ) : (
               <div>
                 {messages.map((m, i) => (
-                  <motion.div
-                    key={i}
+                  <motion.div key={m.id ?? i}
                     initial={{ opacity: 0, y: 4 }}
                     animate={{ opacity: 1, y: 0 }}
                     style={m.role === "assistant" ? styles.rowWithAvatar : styles.row("flex-end")}
@@ -834,23 +971,47 @@ export default function App() {
                       {m.text}
                     </div>
                     {m.role === "assistant" && !m.provisional && (
-                      <button
-                        onClick={() => speakTextSmart(m.text, "en", { replay: true })}
-                        title="Replay"
-                        style={{  
-                          border: "none",
-                          background: "transparent",
-                          cursor: "pointer",
-                          display: "inline-flex",
-                          alignItems: "center",
-                          padding: 4,
-                          opacity: 0.7
-                        }}
-                        aria-label="Replay audio"
-                      >
-                        <Volume2 size={16} />
-                      </button>
+                      (playingKey === m.id && isAudioPlaying) ? (
+                        <button
+                          onClick={stopSpeaking}
+                          title="Stop"
+                          aria-label="Stop audio"
+                          style={{
+                            border: "none",
+                            background: "transparent",
+                            cursor: "pointer",
+                            display: "inline-flex",
+                            alignItems: "center",
+                            padding: 4,
+                            opacity: 0.9,
+                          }}
+                        >
+                          <Square size={16} />
+                        </button>
+                      ) : (
+                        <button
+                          onClick={() => {
+                            stopSpeaking();
+                            setPlayingKey(m.id);
+                            speakTextSmart(m.text, "en", { replay: true, msgId: m.id });
+                          }}
+                          title="Replay"
+                          aria-label="Replay audio"
+                          style={{
+                            border: "none",
+                            background: "transparent",
+                            cursor: "pointer",
+                            display: "inline-flex",
+                            alignItems: "center",
+                            padding: 4,
+                            opacity: 0.7,
+                          }}
+                        >
+                          <Volume2 size={16} />
+                        </button>
+                      )
                     )}
+
                   </div>
                   </motion.div>
                 ))}
@@ -886,18 +1047,31 @@ export default function App() {
                   {displayStatus}
                 </span>
               )}
+              {needsUserTap && (
+                <button
+                  onClick={() => { try { audioRef.current?.play(); } catch {} }}
+                  style={{ marginLeft: 8, border: '1px solid ' + ACCENT, color: ACCENT, background: '#fff', borderRadius: 20, padding: '6px 10px', fontSize: 12, cursor: 'pointer' }}
+                  title="Enable audio"
+                >
+                🔈 点击启用音频
+                </button>
+              )}
             </div>
 
             {/* Controls: either show recording CTA or text input depending on mode */}
-            {mode === "voice" ? (
-              <button
-                onClick={recording ? endConversation : startConversation}
-                style={styles.cta(recording)}
-                aria-label={recording ? "End conversation" : "Start conversation"}
-              >
-                {recording ? <Square size={16}/> : <Mic size={16}/>} {recording ? "End conversation" : "Start conversation"}
-              </button>
-            ) : (
+              {mode === "voice" ? (
+                <button
+                  onClick={voiceCta.onClick}
+                  disabled={voiceCta.disabled}
+                  style={{
+                    ...styles.cta(voiceCta.danger),
+                    ...(voiceCta.disabled ? styles.ctaDisabled : null),
+                  }}
+                  aria-label={voiceCta.aria}
+                >
+                  {voiceCta.icon} {voiceCta.label}
+                </button>
+              ) : (
               <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
                 <input
                   value={textInput}
@@ -925,7 +1099,7 @@ export default function App() {
         </div>
       </main>
 
-      <audio ref={audioRef} preload="auto" />
+      <audio ref={audioRef} preload="auto" playsInline/>
 
       {/* Footer */}
       <footer style={styles.footer}>
